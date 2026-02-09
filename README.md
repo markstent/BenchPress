@@ -1,6 +1,10 @@
 # BenchPress
 
-Personal LLM evaluation harness. Run the same prompts against different models, auto-score via LLM-as-judge and DeepEval, and compare over time. Results persist as per-model JSON files in `results/`.
+I built BenchPress because public leaderboards weren't telling me what I actually needed to know. They measure trivia, memorisation, and sanitised multiple-choice questions - not whether a model can debug real code, resist sycophancy, or follow precise instructions under constraints.
+
+This is a personal evaluation harness that runs 80 prompts across 8 categories - coding, reasoning, writing, instruction following, behavioural traps, research, learning, and meta-cognition - against any model I want to test. Every response is auto-scored through three layers: deterministic heuristic checks, an LLM-as-judge (1-5), and DeepEval G-Eval metrics (0-1). Results persist as JSON, so when a new model drops I run the eval and compare it against everything I've tested before.
+
+The prompt set is deliberately opinionated. It includes trap questions that tempt hallucination, false premises that reward pushback over agreement, constraint-heavy tasks that punish verbosity, and coding problems with no bug to find. The kind of stuff that separates models that are actually useful from models that just benchmark well.
 
 ![Dashboard](docs/screenshot.png)
 
