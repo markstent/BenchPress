@@ -5,6 +5,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .deepeval/
+.claude/
+.playwright-mcp/
+CLAUDE.md
+dashboard.html
+categories.html
 *.png
 *.jpg
 !docs/screenshot.png

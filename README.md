@@ -6,6 +6,8 @@ This is a personal evaluation harness that runs 80 prompts across 8 categories -
 
 The prompt set is deliberately opinionated. It includes trap questions that tempt hallucination, false premises that reward pushback over agreement, constraint-heavy tasks that punish verbosity, and coding problems with no bug to find. The kind of stuff that separates models that are actually useful from models that just benchmark well.
 
+I'll keep adding models and updating results as I get to them - hope it's useful to someone.
+
 ![Dashboard](docs/screenshot.png)
 
 ## Quick Start
