@@ -49,13 +49,16 @@ def latest_run(model_data, pid):
     return runs[-1] if runs else {}
 
 
-def compute_stats(models, prompts, judge_model=None, composite_config=None):
+def compute_stats(models, prompts, judge_model=None, composite_config=None, models_cfg=None):
     """Compute all stats needed for the dashboard."""
     judge_weight = (composite_config or {}).get("judge_weight", 0.5)
     deepeval_weight = (composite_config or {}).get("deepeval_weight", 0.5)
+    models_cfg = models_cfg or {}
     pids = [p["id"] for p in prompts]
     categories = sorted(set(p["category"] for p in prompts))
     cat_pids = {c: [p["id"] for p in prompts if p["category"] == c] for c in categories}
+    difficulties = ["easy", "medium", "hard"]
+    diff_pids = {d: [p["id"] for p in prompts if p["difficulty"] == d] for d in difficulties}
 
     leaderboard = []
     for name, data in models.items():
@@ -123,6 +126,44 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None):
             else:
                 cat_composite[cat] = None
 
+        # Difficulty scores (same pattern as cat_scores)
+        diff_scores = {}
+        diff_deepeval = {}
+        diff_composite = {}
+        for d in difficulties:
+            ds = [
+                runs_cache[pid].get("judge_score")
+                for pid in diff_pids[d]
+                if runs_cache[pid] and runs_cache[pid].get("judge_score") is not None
+            ]
+            diff_scores[d] = round(sum(ds) / len(ds), 2) if ds else None
+            d_de = [
+                runs_cache[pid].get("deepeval_avg")
+                for pid in diff_pids[d]
+                if runs_cache[pid] and runs_cache[pid].get("deepeval_avg") is not None
+            ]
+            diff_deepeval[d] = round(sum(d_de) / len(d_de), 2) if d_de else None
+            d_nj = (diff_scores[d] - 1) / 4 if diff_scores[d] is not None else None
+            d_da = diff_deepeval[d]
+            if d_nj is not None and d_da is not None:
+                diff_composite[d] = round(judge_weight * d_nj + deepeval_weight * d_da, 4)
+            elif d_nj is not None:
+                diff_composite[d] = round(d_nj, 4)
+            elif d_da is not None:
+                diff_composite[d] = round(d_da, 4)
+            else:
+                diff_composite[d] = None
+
+        # Judge agreement / divergence
+        divergences = []
+        for pid in pids:
+            run = runs_cache[pid]
+            if run and not run.get("error"):
+                js, da = run.get("judge_score"), run.get("deepeval_avg")
+                if js is not None and da is not None:
+                    divergences.append(abs((js - 1) / 4 - da))
+        avg_divergence = round(sum(divergences) / len(divergences), 4) if divergences else None
+
         # Score distribution
         dist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
         for s in scores:
@@ -160,8 +201,15 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None):
             and any(v is not None for v in runs_cache[pid]["deepeval_scores"].values())
         )
 
+        # Inject company and launch_date from config
+        mcfg = models_cfg.get(name, {})
+        company = mcfg.get("company", "Unknown")
+        launch_date = mcfg.get("launch_date")
+
         leaderboard.append({
             "name": name,
+            "company": company,
+            "launch_date": launch_date,
             "avg_score": round(avg_s, 2),
             "scored": len(scores),
             "de_scored": de_scored,
@@ -179,6 +227,10 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None):
             "cat_deepeval": cat_deepeval,
             "composite_score": composite_score,
             "cat_composite": cat_composite,
+            "diff_scores": diff_scores,
+            "diff_deepeval": diff_deepeval,
+            "diff_composite": diff_composite,
+            "avg_divergence": avg_divergence,
         })
 
     leaderboard.sort(key=lambda x: (x["scored"] > 0, x["composite_score"] or 0), reverse=True)
@@ -191,20 +243,57 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None):
         for name in models:
             run = latest_run(models[name], pid)
             if run:
-                fl = run.get("auto_checks", {}).get("flags", [])
+                fl = [f for f in run.get("auto_checks", {}).get("flags", [])
+                      if not f.startswith("API_ERROR") and f != "EMPTY_RESPONSE"]
                 if fl:
                     row[name] = fl
         if row:
             flags.append({"id": pid, "subcategory": p["subcategory"], "models": row})
 
+    companies = sorted(set(m.get("company", "Unknown") for m in leaderboard))
+
+    # Prompt-level results (Feature 5)
+    prompt_results = []
+    for p in prompts:
+        pr = {
+            "id": p["id"],
+            "category": p["category"],
+            "subcategory": p["subcategory"],
+            "difficulty": p["difficulty"],
+            "prompt_text": p["prompt"][:200],
+            "models": {},
+        }
+        for name, data in models.items():
+            run = latest_run(data, p["id"])
+            if run and not run.get("error"):
+                pr["models"][name] = {
+                    "judge_score": run.get("judge_score"),
+                    "deepeval_avg": run.get("deepeval_avg"),
+                    "latency_s": round(run.get("latency_s", 0), 1),
+                    "error": False,
+                    "flags": run.get("auto_checks", {}).get("flags", []),
+                }
+            elif run and run.get("error"):
+                pr["models"][name] = {
+                    "judge_score": None,
+                    "deepeval_avg": None,
+                    "latency_s": 0,
+                    "error": True,
+                    "flags": [],
+                }
+        prompt_results.append(pr)
+
     return {
         "leaderboard": leaderboard,
         "categories": categories,
+        "companies": companies,
         "flags": flags,
         "total_prompts": len(pids),
         "total_models": len(models),
         "judge_model": judge_model,
         "generated": datetime.now().isoformat(),
+        "difficulties": difficulties,
+        "prompt_results": prompt_results,
     }
 
 
@@ -587,7 +676,21 @@ def generate_html(stats):
     .container {{ padding: 1rem; }}
     .header {{ padding: 1rem; }}
     .header-top {{ flex-direction: column; align-items: flex-start; gap: 0.5rem; }}
+    .col-detail {{ display: none; }}
+    .show-all-cols .col-detail {{ display: table-cell; }}
+    .col-toggle {{ display: inline-block; }}
   }}
+  .col-toggle {{
+    display: none;
+    padding: 0.35rem 0.75rem;
+    background: var(--surface2);
+    color: var(--text2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }}
+  .col-toggle:hover {{ color: var(--text); }}
   @media (max-width: 600px) {{
     .kpi-row {{ grid-template-columns: 1fr 1fr; gap: 0.75rem; }}
     .kpi {{ padding: 1rem; }}
@@ -614,7 +717,9 @@ def generate_html(stats):
       <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
       <nav class="nav">
         <a href="index.html" class="nav-link active">Overview</a>
+        <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link">By Category</a>
+        <a href="prompts.html" class="nav-link">Prompts</a>
         <a href="methodology.html" class="nav-link">Methodology</a>
       </nav>
     </div>
@@ -652,23 +757,33 @@ def generate_html(stats):
 <!-- Leaderboard + Score Chart -->
 <div class="grid-full">
   <div class="card">
-    <h2>Leaderboard <span class="info-tip" data-info="Ranked by composite score. Click column headers to re-sort.">?</span></h2>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 style="margin-bottom:0">Leaderboard <span class="info-tip" data-info="Ranked by composite score. Click column headers to re-sort.">?</span></h2>
+      <div style="display:flex;gap:0.5rem;align-items:center">
+      <button class="col-toggle" id="col-toggle-btn" onclick="this.closest('.card').querySelector('.table-scroll').classList.toggle('show-all-cols');this.textContent=this.textContent==='Show all columns'?'Hide columns':'Show all columns'">Show all columns</button>
+      <select id="company-filter" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.75rem;font-size:0.8rem;cursor:pointer">
+        <option value="">All Companies</option>
+      </select>
+      </div>
+    </div>
     <div class="table-scroll">
       <table id="leaderboard-table">
         <thead>
           <tr>
             <th style="width:3rem" data-sort="rank" data-type="num">#</th>
             <th data-sort="name" data-type="str">Model</th>
+            <th data-sort="company" data-type="str">Company</th>
             <th data-sort="composite" data-type="num" class="desc">Composite</th>
             <th data-sort="score" data-type="num">Judge</th>
             <th class="num" data-sort="deepeval" data-type="num">DeepEval</th>
-            <th class="num" data-sort="scored" data-type="num">Judged</th>
-            <th class="num" data-sort="de_scored" data-type="num">DE Scored</th>
+            <th class="num col-detail" data-sort="scored" data-type="num">Judged</th>
+            <th class="num col-detail" data-sort="de_scored" data-type="num">DE Scored</th>
             <th class="num" data-sort="errors" data-type="num">Errors</th>
             <th class="num" data-sort="flags" data-type="num">Flags</th>
-            <th class="num" data-sort="latency" data-type="num">Avg Latency</th>
-            <th class="num" data-sort="tokens" data-type="num">Avg Tokens</th>
+            <th class="num col-detail" data-sort="latency" data-type="num">Avg Latency</th>
+            <th class="num col-detail" data-sort="tokens" data-type="num">Avg Tokens</th>
             <th class="num" data-sort="efficiency" data-type="num">Efficiency</th>
+            <th class="num col-detail" data-sort="divergence" data-type="num">Divergence</th>
           </tr>
         </thead>
         <tbody>
@@ -694,6 +809,22 @@ def generate_html(stats):
     <h2>Efficiency <span class="info-tip" data-info="Quality per token: avg_score / log2(avg_tokens). Higher means better quality with fewer tokens.">?</span></h2>
     <div class="chart-container">
       <canvas id="efficiencyChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Difficulty + Agreement charts -->
+<div class="grid-2">
+  <div class="card">
+    <h2>Performance by Difficulty <span class="info-tip" data-info="Composite scores for easy, medium, and hard prompts across top 5 models.">?</span></h2>
+    <div class="chart-container">
+      <canvas id="difficultyChart"></canvas>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Judge vs DeepEval Divergence <span class="info-tip" data-info="Average absolute difference between normalised judge score (0-1) and DeepEval average per model. Lower means the two scoring methods agree more.">?</span></h2>
+    <div class="chart-container">
+      <canvas id="agreementChart"></canvas>
     </div>
   </div>
 </div>
@@ -936,9 +1067,174 @@ new Chart(document.getElementById('distChart'), {{
         }}
       }});
       rows.forEach(r => tbody.appendChild(r));
+      setParams({{ sort: key, dir: dir }});
     }});
   }});
 }})();
+
+// URL param utilities
+function getParams() {{ return Object.fromEntries(new URLSearchParams(location.search)); }}
+function setParams(obj) {{
+  const p = new URLSearchParams(location.search);
+  Object.entries(obj).forEach(([k, v]) => {{
+    if (v === '' || v == null) p.delete(k);
+    else p.set(k, v);
+  }});
+  const qs = p.toString();
+  history.replaceState(null, '', qs ? '?' + qs : location.pathname);
+}}
+
+// Company filter dropdown
+(function() {{
+  const sel = document.getElementById('company-filter');
+  if (!sel) return;
+  const companies = DATA.companies || [];
+  companies.forEach(c => {{
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    sel.appendChild(opt);
+  }});
+
+  function filterByCompany(val) {{
+    const rows = document.querySelectorAll('#leaderboard-table tbody tr');
+    rows.forEach(r => {{
+      r.style.display = (!val || r.dataset.company === val) ? '' : 'none';
+    }});
+  }}
+
+  sel.addEventListener('change', () => {{
+    filterByCompany(sel.value);
+    setParams({{ company: sel.value }});
+  }});
+
+  // Restore from URL
+  const params = getParams();
+  if (params.company) {{
+    sel.value = params.company;
+    filterByCompany(params.company);
+  }}
+}})();
+
+// Restore sort from URL
+(function() {{
+  const params = getParams();
+  if (params.sort) {{
+    const th = document.querySelector('#leaderboard-table th[data-sort="' + params.sort + '"]');
+    if (th) {{
+      const dir = params.dir || 'desc';
+      // Clear existing
+      document.querySelectorAll('#leaderboard-table th[data-sort]').forEach(h => h.classList.remove('asc', 'desc'));
+      th.classList.add(dir);
+      const tbody = document.querySelector('#leaderboard-table tbody');
+      const type = th.dataset.type;
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      rows.sort((a, b) => {{
+        let va = a.dataset[params.sort];
+        let vb = b.dataset[params.sort];
+        if (type === 'num') {{
+          va = parseFloat(va) || 0;
+          vb = parseFloat(vb) || 0;
+          return dir === 'asc' ? va - vb : vb - va;
+        }} else {{
+          return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        }}
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+    }}
+  }}
+}})();
+
+// Difficulty grouped bar chart (top 5 models)
+(function() {{
+  const canvas = document.getElementById('difficultyChart');
+  if (!canvas) return;
+  const diffs = DATA.difficulties || ['easy', 'medium', 'hard'];
+  const top5 = lb.slice(0, 5);
+  const diffColors = {{ easy: '#22c55e', medium: '#eab308', hard: '#ef4444' }};
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: top5.map(m => m.name),
+      datasets: diffs.map(d => ({{
+        label: d.charAt(0).toUpperCase() + d.slice(1),
+        data: top5.map(m => (m.diff_composite && m.diff_composite[d]) || 0),
+        backgroundColor: diffColors[d] + 'cc',
+        borderColor: diffColors[d],
+        borderWidth: 1,
+        borderRadius: 4,
+      }}))
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }}
+      }},
+      scales: {{
+        y: {{ min: 0, max: 1, ticks: {{ stepSize: 0.2 }} }},
+        x: {{ ticks: {{ maxRotation: 45, font: {{ size: 11 }} }} }}
+      }}
+    }}
+  }});
+}})();
+
+// Judge vs DeepEval divergence bar chart
+(function() {{
+  const canvas = document.getElementById('agreementChart');
+  if (!canvas) return;
+
+  const divData = lb
+    .filter(m => m.avg_divergence != null && m.scored > 0)
+    .map(m => ({{ name: m.name, div: m.avg_divergence }}))
+    .sort((a, b) => a.div - b.div);
+
+  if (!divData.length) return;
+
+  function divColor(d) {{
+    if (d <= 0.05) return '#22c55e';
+    if (d <= 0.10) return '#86efac';
+    if (d <= 0.15) return '#eab308';
+    if (d <= 0.20) return '#f97316';
+    return '#ef4444';
+  }}
+
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: divData.map(d => d.name),
+      datasets: [{{
+        data: divData.map(d => d.div),
+        backgroundColor: divData.map(d => divColor(d.div) + 'cc'),
+        borderColor: divData.map(d => divColor(d.div)),
+        borderWidth: 1,
+        borderRadius: 4,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          callbacks: {{
+            label: function(ctx) {{
+              return 'Divergence: ' + ctx.raw.toFixed(3);
+            }}
+          }}
+        }}
+      }},
+      scales: {{
+        y: {{ beginAtZero: true, title: {{ display: true, text: 'Divergence', color: '#8b90a5' }} }},
+        x: {{ ticks: {{ maxRotation: 45, font: {{ size: 10 }} }} }}
+      }}
+    }}
+  }});
+}})();
+
 </script>
 
 </body>
@@ -1006,6 +1302,37 @@ def _efficiency_color(score):
     return "color:var(--orange)"
 
 
+def _nav_html(active_page, stats):
+    """Generate the nav bar HTML with the active page highlighted."""
+    pages = [
+        ("index.html", "Overview"),
+        ("companies.html", "Companies"),
+        ("categories.html", "By Category"),
+        ("prompts.html", "Prompts"),
+        ("methodology.html", "Methodology"),
+    ]
+    links = []
+    for href, label in pages:
+        cls = "nav-link active" if href == active_page else "nav-link"
+        links.append(f'<a href="{href}" class="{cls}">{label}</a>')
+    return f'<nav class="nav">{"".join(links)}</nav>'
+
+
+def _divergence_color(score):
+    """Return inline CSS color for divergence (lower is better)."""
+    if score is None:
+        return "color:var(--text2)"
+    if score <= 0.05:
+        return "color:#22c55e"
+    if score <= 0.10:
+        return "color:#86efac"
+    if score <= 0.15:
+        return "color:var(--yellow)"
+    if score <= 0.20:
+        return "color:var(--orange)"
+    return "color:var(--red)"
+
+
 def _deepeval_breakdown_card(leaderboard):
     """Generate the DeepEval Breakdown card HTML."""
     # Check if any model has DeepEval data
@@ -1015,7 +1342,8 @@ def _deepeval_breakdown_card(leaderboard):
 
     metric_names = {"correctness": "Correctness", "coherence": "Coherence", "instruction_following": "Instruction Following"}
     rows = ""
-    for i, m in enumerate(leaderboard):
+    sorted_lb = sorted(leaderboard, key=lambda m: m.get("deepeval_avg") or 0, reverse=True)
+    for i, m in enumerate(sorted_lb):
         de_avg = m.get("deepeval_avg")
         de_metrics = m.get("deepeval_metrics", {})
         if de_avg is None:
@@ -1089,19 +1417,28 @@ def _leaderboard_row(i, m):
     de_data = f"{de_val}" if de_val is not None else "0"
     de_color = _deepeval_color(de_val)
 
-    return f"""<tr data-rank="{i+1}" data-name="{m['name']}" data-composite="{comp_data}" data-score="{m['avg_score']}" data-deepeval="{de_data}" data-scored="{m['scored']}" data-de_scored="{m['de_scored']}" data-errors="{m['errors']}" data-flags="{m['flagged']}" data-latency="{m['avg_latency']}" data-tokens="{m['avg_tokens']}" data-efficiency="{m['efficiency']}">
+    company = m.get('company', 'Unknown')
+
+    div_val = m.get("avg_divergence")
+    div_str = f"{div_val:.3f}" if div_val is not None else "-"
+    div_data = f"{div_val}" if div_val is not None else "0"
+    div_color = _divergence_color(div_val)
+
+    return f"""<tr data-rank="{i+1}" data-name="{m['name']}" data-company="{company}" data-composite="{comp_data}" data-score="{m['avg_score']}" data-deepeval="{de_data}" data-scored="{m['scored']}" data-de_scored="{m['de_scored']}" data-errors="{m['errors']}" data-flags="{m['flagged']}" data-latency="{m['avg_latency']}" data-tokens="{m['avg_tokens']}" data-efficiency="{m['efficiency']}" data-divergence="{div_data}">
       <td><span class="rank {rank_cls}">{i+1}</span></td>
       <td style="font-weight:600">{m['name']}</td>
+      <td style="color:var(--text2);font-size:0.8rem">{company}</td>
       <td class="num" style="font-weight:700;{comp_color}">{comp_str}</td>
       <td class="num {sc}" style="font-weight:600">{m['avg_score']:.2f}/5</td>
       <td class="num" style="font-weight:600;{de_color}">{de_str}</td>
-      <td class="num">{m['scored']}/{m['total']}</td>
-      <td class="num">{m['de_scored']}/{m['total']}</td>
+      <td class="num col-detail">{m['scored']}/{m['total']}</td>
+      <td class="num col-detail">{m['de_scored']}/{m['total']}</td>
       <td class="num">{errors_badge}</td>
       <td class="num">{flags_badge}</td>
-      <td class="num">{m['avg_latency']:.1f}s</td>
-      <td class="num">{m['avg_tokens']:.0f}</td>
+      <td class="num col-detail">{m['avg_latency']:.1f}s</td>
+      <td class="num col-detail">{m['avg_tokens']:.0f}</td>
       <td class="num" style="font-weight:600;{_efficiency_color(m['efficiency'])}">{m['efficiency']:.2f}</td>
+      <td class="num col-detail" style="font-weight:600;{div_color}">{div_str}</td>
     </tr>"""
 
 
@@ -1294,6 +1631,27 @@ def generate_categories_html(stats):
     width: 100%;
     height: 300px;
   }}
+  td[data-tip] {{
+    position: relative;
+    cursor: default;
+  }}
+  td[data-tip]:hover::after {{
+    content: attr(data-tip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface2);
+    color: var(--text);
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 400;
+    white-space: nowrap;
+    z-index: 10;
+    pointer-events: none;
+    border: 1px solid var(--border);
+  }}
   @media (max-width: 1100px) {{
     .chart-grid {{ grid-template-columns: 1fr; }}
     .winners {{ grid-template-columns: repeat(2, 1fr); }}
@@ -1323,7 +1681,9 @@ def generate_categories_html(stats):
       <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
       <nav class="nav">
         <a href="index.html" class="nav-link">Overview</a>
+        <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link active">By Category</a>
+        <a href="prompts.html" class="nav-link">Prompts</a>
         <a href="methodology.html" class="nav-link">Methodology</a>
       </nav>
     </div>
@@ -1410,6 +1770,634 @@ cats.forEach(cat => {{
 </html>"""
 
 
+def generate_companies_html(stats):
+    """Generate the companies analytics page."""
+    data_json = json.dumps(stats)
+
+    # Build per-company model tables (server-side)
+    company_models = {}
+    for m in stats["leaderboard"]:
+        c = m.get("company", "Unknown")
+        company_models.setdefault(c, []).append(m)
+
+    company_sections = ""
+    for company in sorted(company_models):
+        models = sorted(company_models[company], key=lambda x: x.get("composite_score") or 0, reverse=True)
+        best = models[0]
+        best_comp = best.get("composite_score")
+        best_str = f"{best_comp:.2f}" if best_comp is not None else "-"
+
+        rows = ""
+        for m in models:
+            comp = m.get("composite_score")
+            comp_str = f"{comp:.2f}" if comp is not None else "-"
+            comp_color = _composite_color(comp)
+            de_val = m.get("deepeval_avg")
+            de_str = f"{de_val:.2f}" if de_val is not None else "-"
+            de_color = _deepeval_color(de_val)
+            sc_color = _score_color(m["avg_score"])
+            eff_color = _efficiency_color(m["efficiency"])
+            rows += f"""<tr>
+              <td style="font-weight:600">{m['name']}</td>
+              <td class="num" style="font-weight:700;{comp_color}">{comp_str}</td>
+              <td class="num {sc_color}" style="font-weight:600">{m['avg_score']:.2f}/5</td>
+              <td class="num" style="font-weight:600;{de_color}">{de_str}</td>
+              <td class="num">{m['avg_latency']:.1f}s</td>
+              <td class="num" style="font-weight:600;{eff_color}">{m['efficiency']:.2f}</td>
+            </tr>\n"""
+
+        company_sections += f"""<details class="company-section">
+      <summary class="company-toggle">{html_mod.escape(company)} <span class="company-count">({len(models)} model{"s" if len(models) != 1 else ""}) - best: {best_str}</span></summary>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th class="num">Composite</th>
+              <th class="num">Judge</th>
+              <th class="num">DeepEval</th>
+              <th class="num">Avg Latency</th>
+              <th class="num">Efficiency</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows}
+          </tbody>
+        </table>
+      </div>
+    </details>\n"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BenchPress - Companies</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+<style>
+  :root {{
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3345;
+    --text: #e4e7f0;
+    --text2: #8b90a5;
+    --accent: #6c72ff;
+    --accent2: #4ecdc4;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --orange: #f97316;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }}
+  .header {{
+    background: linear-gradient(135deg, #1a1d27 0%, #242836 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 1.5rem 2.5rem;
+  }}
+  .header-inner {{
+    max-width: 1440px;
+    margin: 0 auto;
+  }}
+  .header-top {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.25rem;
+  }}
+  .header h1 {{ font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; margin: 0; }}
+  .header .byline {{ font-size: 0.85rem; color: var(--text2); margin: 0.2rem 0 0; }}
+  .header .meta {{ font-size: 0.75rem; color: var(--text2); margin-top: 0.5rem; }}
+  .nav {{
+    display: flex;
+    gap: 0.25rem;
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 0.25rem;
+  }}
+  .nav-link {{
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text2);
+    text-decoration: none;
+    transition: all 0.2s;
+  }}
+  .nav-link:hover {{ color: var(--text); background: rgba(255,255,255,0.05); }}
+  .nav-link.active {{ color: var(--text); background: var(--accent); }}
+  .container {{
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 1.5rem 2.5rem 3rem;
+  }}
+  .company-cards {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.6rem;
+    margin-bottom: 1.5rem;
+  }}
+  .company-card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem 0.9rem;
+  }}
+  .company-card .company-name {{
+    font-size: 0.65rem;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.25rem;
+  }}
+  .company-card .best-model {{
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 0.1rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .company-card .best-score {{
+    font-size: 1.15rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }}
+  .company-card .model-count {{
+    font-size: 0.7rem;
+    color: var(--text2);
+    margin-top: 0.15rem;
+  }}
+  .grid-full {{
+    margin-bottom: 1.5rem;
+  }}
+  .card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+  }}
+  .card h2 {{
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+  }}
+  .chart-container {{
+    position: relative;
+    width: 100%;
+    min-height: 320px;
+    height: 320px;
+  }}
+  .info-tip {{
+    display: inline-block;
+    position: relative;
+    width: 16px;
+    height: 16px;
+    line-height: 16px;
+    text-align: center;
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--text2);
+    background: var(--surface2);
+    border-radius: 50%;
+    margin-left: 6px;
+    cursor: default;
+    vertical-align: middle;
+  }}
+  .info-tip:hover::after {{
+    content: attr(data-info);
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 400;
+    white-space: nowrap;
+    z-index: 20;
+    pointer-events: none;
+    border: 1px solid var(--border);
+  }}
+  .table-scroll {{
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }}
+  th {{
+    text-align: left;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 2px solid var(--border);
+    color: var(--text2);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }}
+  th.num {{ text-align: right; }}
+  td {{
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }}
+  td.num {{ text-align: right; }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr:hover td {{ background: var(--surface2); }}
+  .heatmap-cell {{
+    text-align: center;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    padding: 0.5rem;
+    border-radius: 4px;
+  }}
+  .company-section {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 1rem;
+    overflow: hidden;
+  }}
+  .company-toggle {{
+    padding: 1rem 1.5rem;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.95rem;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }}
+  .company-toggle::-webkit-details-marker {{ display: none; }}
+  .company-toggle::before {{
+    content: '\\25B6';
+    font-size: 0.7rem;
+    color: var(--text2);
+    transition: transform 0.2s;
+  }}
+  details.company-section[open] .company-toggle::before {{
+    transform: rotate(90deg);
+  }}
+  .company-count {{
+    font-weight: 400;
+    color: var(--text2);
+    font-size: 0.85rem;
+  }}
+  .company-section .table-scroll {{
+    padding: 0 1.5rem 1rem;
+  }}
+  .score-cell {{
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }}
+  .score-5 {{ color: var(--green); }}
+  .score-4 {{ color: #86efac; }}
+  .score-3 {{ color: var(--yellow); }}
+  .score-2 {{ color: var(--orange); }}
+  .score-1 {{ color: var(--red); }}
+  @media (max-width: 900px) {{
+    .header {{ padding: 1rem; }}
+    .header-top {{ flex-direction: column; align-items: flex-start; gap: 0.5rem; }}
+    .container {{ padding: 1rem; }}
+  }}
+  @media (max-width: 600px) {{
+    .company-cards {{ grid-template-columns: 1fr 1fr; gap: 0.5rem; }}
+    .container {{ padding: 0.75rem; }}
+    .header {{ padding: 1rem 0.75rem; }}
+    .header h1 {{ font-size: 1.2rem; }}
+    .card {{ padding: 1rem; }}
+    .card h2 {{ font-size: 0.9rem; }}
+    .chart-container {{ height: 260px; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-inner">
+    <div class="header-top">
+      <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
+      <nav class="nav">
+        <a href="index.html" class="nav-link">Overview</a>
+        <a href="companies.html" class="nav-link active">Companies</a>
+        <a href="categories.html" class="nav-link">By Category</a>
+        <a href="prompts.html" class="nav-link">Prompts</a>
+        <a href="methodology.html" class="nav-link">Methodology</a>
+      </nav>
+    </div>
+    <p class="byline">Opinionated in scope. Objective in execution.</p>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- Company Progress Over Time -->
+<div class="grid-full">
+  <div class="card">
+    <h2>Company Progress Over Time <span class="info-tip" data-info="Best composite score per company at each model launch date. Shows running maximum - each company's frontier performance over time.">?</span></h2>
+    <div class="chart-container" style="height:450px">
+      <canvas id="timelineChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Company Summary Cards -->
+<div id="company-cards" class="company-cards"></div>
+
+<!-- Best-of-Company Bar Chart -->
+<div class="grid-full">
+  <div class="card">
+    <h2>Best Model per Company <span class="info-tip" data-info="Each company's top model composite score, sorted by best performance.">?</span></h2>
+    <div class="chart-container">
+      <canvas id="bestOfCompanyChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Category Strengths Heatmap -->
+<div class="grid-full">
+  <div class="card">
+    <h2>Category Strengths by Company <span class="info-tip" data-info="Best model score per company for each category. Bold indicates the leading company.">?</span></h2>
+    <div class="table-scroll">
+      <table id="heatmap-table"></table>
+    </div>
+  </div>
+</div>
+
+<!-- Per-Company Model Tables -->
+<div class="grid-full">
+  <h2 style="margin-bottom:1rem">Models by Company</h2>
+  {company_sections}
+</div>
+
+</div>
+
+<script>
+const DATA = {data_json};
+const lb = DATA.leaderboard;
+const cats = DATA.categories;
+
+const COLORS = [
+  '#6c72ff', '#4ecdc4', '#f97316', '#22c55e', '#ec4899',
+  '#eab308', '#8b5cf6', '#06b6d4', '#ef4444', '#84cc16',
+  '#f59e0b', '#14b8a6'
+];
+
+function compositeColor(s) {{
+  if (s >= 0.95) return '#22c55e';
+  if (s >= 0.90) return '#4ade80';
+  if (s >= 0.85) return '#86efac';
+  if (s >= 0.80) return '#eab308';
+  if (s >= 0.70) return '#f97316';
+  return '#ef4444';
+}}
+
+Chart.defaults.color = '#8b90a5';
+Chart.defaults.borderColor = '#2e3345';
+Chart.defaults.font.family = "'Inter', sans-serif";
+
+// Group models by company
+const byCompany = {{}};
+lb.forEach(m => {{
+  const c = m.company || 'Unknown';
+  if (!byCompany[c]) byCompany[c] = [];
+  byCompany[c].push(m);
+}});
+
+// 1. Company Summary Cards
+(function() {{
+  const container = document.getElementById('company-cards');
+  if (!container) return;
+  const companies = Object.keys(byCompany).sort((a, b) => {{
+    const bestA = Math.max(...byCompany[a].map(m => m.composite_score || 0));
+    const bestB = Math.max(...byCompany[b].map(m => m.composite_score || 0));
+    return bestB - bestA;
+  }});
+  companies.forEach(company => {{
+    const models = byCompany[company];
+    const best = models.reduce((a, b) => ((a.composite_score || 0) >= (b.composite_score || 0) ? a : b));
+    const avgComp = models.filter(m => m.composite_score != null).reduce((s, m) => s + m.composite_score, 0) / (models.filter(m => m.composite_score != null).length || 1);
+    const bestScore = best.composite_score;
+    const color = bestScore != null ? compositeColor(bestScore) : '#8b90a5';
+    const card = document.createElement('div');
+    card.className = 'company-card';
+    card.innerHTML = `
+      <div class="company-name">${{company}}</div>
+      <div class="best-model" title="${{best.name}}">${{best.name}}</div>
+      <div class="best-score" style="color:${{color}}">${{bestScore != null ? bestScore.toFixed(2) : '-'}}</div>
+      <div class="model-count">${{models.length}} model${{models.length !== 1 ? 's' : ''}} &middot; avg ${{avgComp.toFixed(2)}}</div>
+    `;
+    container.appendChild(card);
+  }});
+}})();
+
+// 2. Best-of-Company horizontal bar chart
+(function() {{
+  const canvas = document.getElementById('bestOfCompanyChart');
+  if (!canvas) return;
+  const entries = Object.keys(byCompany).map(company => {{
+    const best = byCompany[company].reduce((a, b) => ((a.composite_score || 0) >= (b.composite_score || 0) ? a : b));
+    return {{ company, score: best.composite_score || 0, model: best.name }};
+  }}).sort((a, b) => b.score - a.score);
+
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: entries.map(e => e.company),
+      datasets: [{{
+        data: entries.map(e => e.score),
+        backgroundColor: entries.map(e => compositeColor(e.score) + 'cc'),
+        borderColor: entries.map(e => compositeColor(e.score)),
+        borderWidth: 1,
+        borderRadius: 4,
+      }}]
+    }},
+    options: {{
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ display: false }},
+        tooltip: {{
+          callbacks: {{
+            label: function(ctx) {{
+              return entries[ctx.dataIndex].model + ': ' + ctx.raw.toFixed(2);
+            }}
+          }}
+        }}
+      }},
+      scales: {{
+        x: {{ min: 0, max: 1, ticks: {{ stepSize: 0.2 }} }},
+        y: {{ ticks: {{ font: {{ size: 12, weight: '600' }} }} }}
+      }}
+    }}
+  }});
+}})();
+
+// 3. Company Progress Over Time chart
+(function() {{
+  const canvas = document.getElementById('timelineChart');
+  if (!canvas) return;
+
+  const timeCompanies = {{}};
+  lb.forEach(m => {{
+    if (!m.launch_date || m.composite_score == null) return;
+    const c = m.company || 'Unknown';
+    if (!timeCompanies[c]) timeCompanies[c] = [];
+    timeCompanies[c].push({{ date: m.launch_date, score: m.composite_score, name: m.name }});
+  }});
+
+  const datasets = [];
+  const companyNames = Object.keys(timeCompanies).sort();
+  companyNames.forEach((company, ci) => {{
+    const points = timeCompanies[company].sort((a, b) => a.date.localeCompare(b.date));
+    let runMax = 0;
+    const data = points.map(p => {{
+      runMax = Math.max(runMax, p.score);
+      return {{ x: p.date, y: runMax, modelName: p.name, rawScore: p.score }};
+    }});
+    datasets.push({{
+      label: company,
+      data: data,
+      borderColor: COLORS[ci % COLORS.length],
+      backgroundColor: COLORS[ci % COLORS.length] + '33',
+      borderWidth: 2,
+      pointRadius: 4,
+      pointHoverRadius: 6,
+      tension: 0.1,
+      fill: false,
+    }});
+  }});
+
+  let allScores = [];
+  datasets.forEach(ds => ds.data.forEach(pt => allScores.push(pt.y)));
+  const dataMin = allScores.length ? Math.min(...allScores) : 0;
+  const dataMax = allScores.length ? Math.max(...allScores) : 1;
+  const padding = (dataMax - dataMin) * 0.15 || 0.05;
+  const yMin = Math.max(0, Math.floor((dataMin - padding) * 20) / 20);
+  const yMax = Math.min(1, Math.ceil((dataMax + padding) * 20) / 20);
+
+  new Chart(canvas, {{
+    type: 'line',
+    data: {{ datasets }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {{
+        x: {{
+          type: 'time',
+          time: {{ unit: 'month', tooltipFormat: 'MMM yyyy' }},
+          title: {{ display: true, text: 'Launch Date', color: '#8b90a5' }},
+        }},
+        y: {{
+          min: yMin,
+          max: yMax,
+          ticks: {{ stepSize: 0.05 }},
+          title: {{ display: true, text: 'Composite Score', color: '#8b90a5' }},
+        }}
+      }},
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }},
+        tooltip: {{
+          callbacks: {{
+            label: function(ctx) {{
+              const pt = ctx.raw;
+              return ctx.dataset.label + ': ' + pt.modelName + ' (' + pt.y.toFixed(2) + ')';
+            }}
+          }}
+        }}
+      }}
+    }}
+  }});
+}})();
+
+// 4. Category Strengths Heatmap
+(function() {{
+  const table = document.getElementById('heatmap-table');
+  if (!table) return;
+
+  const companies = Object.keys(byCompany).sort();
+
+  // For each company+category, find best model score
+  const heatData = {{}};
+  const colWinners = {{}};
+  companies.forEach(company => {{
+    heatData[company] = {{}};
+    cats.forEach(cat => {{
+      let best = null;
+      byCompany[company].forEach(m => {{
+        const s = m.cat_composite && m.cat_composite[cat];
+        if (s != null && (best === null || s > best)) best = s;
+      }});
+      heatData[company][cat] = best;
+    }});
+  }});
+
+  // Find winner per category
+  cats.forEach(cat => {{
+    let bestCompany = null;
+    let bestScore = -1;
+    companies.forEach(company => {{
+      const s = heatData[company][cat];
+      if (s != null && s > bestScore) {{
+        bestScore = s;
+        bestCompany = company;
+      }}
+    }});
+    colWinners[cat] = bestCompany;
+  }});
+
+  // Build table
+  let headerHtml = '<thead><tr><th>Company</th>';
+  cats.forEach(cat => {{
+    headerHtml += '<th class="num" style="font-size:0.7rem">' + cat.replace(/_/g, ' ') + '</th>';
+  }});
+  headerHtml += '</tr></thead>';
+
+  let bodyHtml = '<tbody>';
+  companies.forEach(company => {{
+    bodyHtml += '<tr><td style="font-weight:600">' + company + '</td>';
+    cats.forEach(cat => {{
+      const s = heatData[company][cat];
+      if (s != null) {{
+        const color = compositeColor(s);
+        const bold = colWinners[cat] === company ? 'font-weight:800;' : 'font-weight:600;';
+        bodyHtml += '<td class="num" style="' + bold + 'color:' + color + ';background:' + color + '18;border-radius:4px">' + s.toFixed(2) + '</td>';
+      }} else {{
+        bodyHtml += '<td class="num" style="color:var(--text2)">-</td>';
+      }}
+    }});
+    bodyHtml += '</tr>';
+  }});
+  bodyHtml += '</tbody>';
+
+  table.innerHTML = headerHtml + bodyHtml;
+}})();
+</script>
+
+</body>
+</html>"""
+
+
 def generate_methodology_html(stats):
     """Generate the methodology and focus page."""
     prompts = load_prompts()
@@ -1476,7 +2464,7 @@ def generate_methodology_html(stats):
             )
             check = p.get("check_type", "").replace("_", " ")
 
-            prompt_cards += f"""<div class="prompt-card">
+            prompt_cards += f"""<div class="prompt-card" data-category="{cat}" data-difficulty="{diff}" data-check="{p.get('check_type', '')}">
           <div class="prompt-header">
             <span class="prompt-id">{pid}</span>
             <span class="prompt-subcat">{subcat}</span>
@@ -1808,6 +2796,45 @@ def generate_methodology_html(stats):
     padding-bottom: 0.5rem;
     border-bottom: 2px solid var(--border);
   }}
+  .filter-toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 1rem;
+    padding: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }}
+  .filter-toolbar input[type="text"] {{
+    flex: 1;
+    min-width: 200px;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+    outline: none;
+  }}
+  .filter-toolbar input[type="text"]:focus {{
+    border-color: var(--accent);
+  }}
+  .filter-toolbar select {{
+    padding: 0.5rem 0.75rem;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }}
+  .filter-toolbar .filter-count {{
+    font-size: 0.8rem;
+    color: var(--text2);
+    margin-left: auto;
+  }}
 </style>
 </head>
 <body>
@@ -1818,7 +2845,9 @@ def generate_methodology_html(stats):
       <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
       <nav class="nav">
         <a href="index.html" class="nav-link">Overview</a>
+        <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link">By Category</a>
+        <a href="prompts.html" class="nav-link">Prompts</a>
         <a href="methodology.html" class="nav-link active">Methodology</a>
       </nav>
     </div>
@@ -2024,9 +3053,445 @@ def generate_methodology_html(stats):
 <!-- Questions -->
 <div class="section-divider">All {len(prompts)} Questions</div>
 
+<div class="filter-toolbar">
+  <input type="text" id="search-input" placeholder="Search prompts...">
+  <select id="filter-category">
+    <option value="">All Categories</option>
+    {"".join(f'<option value="{c}">{c.replace("_", " ").title()}</option>' for c in sorted(cats))}
+  </select>
+  <select id="filter-difficulty">
+    <option value="">All Difficulties</option>
+    <option value="easy">Easy</option>
+    <option value="medium">Medium</option>
+    <option value="hard">Hard</option>
+  </select>
+  <select id="filter-check">
+    <option value="">All Check Types</option>
+    {"".join(f'<option value="{ct}">{ct.replace("_", " ").title()}</option>' for ct in sorted(checks))}
+  </select>
+  <span class="filter-count" id="filter-count">{len(prompts)} of {len(prompts)} shown</span>
+</div>
+
 {questions_sections}
 
 </div>
+
+<script>
+(function() {{
+  const searchInput = document.getElementById('search-input');
+  const catFilter = document.getElementById('filter-category');
+  const diffFilter = document.getElementById('filter-difficulty');
+  const checkFilter = document.getElementById('filter-check');
+  const countDisplay = document.getElementById('filter-count');
+  const totalPrompts = {len(prompts)};
+
+  function applyFilters() {{
+    const query = searchInput.value.toLowerCase();
+    const cat = catFilter.value;
+    const diff = diffFilter.value;
+    const check = checkFilter.value;
+    let shown = 0;
+
+    document.querySelectorAll('.prompt-card').forEach(card => {{
+      const matchCat = !cat || card.dataset.category === cat;
+      const matchDiff = !diff || card.dataset.difficulty === diff;
+      const matchCheck = !check || card.dataset.check === check;
+      const matchText = !query || card.textContent.toLowerCase().includes(query);
+      const visible = matchCat && matchDiff && matchCheck && matchText;
+      card.style.display = visible ? '' : 'none';
+      if (visible) shown++;
+    }});
+
+    // Hide category sections where all children are hidden
+    document.querySelectorAll('.category-section').forEach(section => {{
+      const visibleCards = section.querySelectorAll('.prompt-card:not([style*="display: none"])');
+      section.style.display = visibleCards.length > 0 ? '' : 'none';
+    }});
+
+    countDisplay.textContent = shown + ' of ' + totalPrompts + ' shown';
+  }}
+
+  searchInput.addEventListener('input', applyFilters);
+  catFilter.addEventListener('change', applyFilters);
+  diffFilter.addEventListener('change', applyFilters);
+  checkFilter.addEventListener('change', applyFilters);
+}})();
+</script>
+
+</body>
+</html>"""
+
+
+def generate_prompts_html(stats):
+    """Generate the prompt-level results page."""
+    # We only embed prompt_results (not full stats) to keep page size reasonable
+    prompts_data = stats.get("prompt_results", [])
+    categories = stats["categories"]
+    data_json = json.dumps({
+        "prompt_results": prompts_data,
+        "categories": categories,
+        "difficulties": stats.get("difficulties", ["easy", "medium", "hard"]),
+        "leaderboard": [{"name": m["name"]} for m in stats["leaderboard"]],
+    })
+
+    nav_html = _nav_html("prompts.html", stats)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BenchPress - Prompt Results</title>
+<style>
+  :root {{
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242836;
+    --border: #2e3345;
+    --text: #e4e7f0;
+    --text2: #8b90a5;
+    --accent: #6c72ff;
+    --accent2: #4ecdc4;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --orange: #f97316;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+  }}
+  .header {{
+    background: linear-gradient(135deg, #1a1d27 0%, #242836 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 1.5rem 2.5rem;
+  }}
+  .header-inner {{
+    max-width: 1440px;
+    margin: 0 auto;
+  }}
+  .header-top {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.25rem;
+  }}
+  .header h1 {{ font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; margin: 0; }}
+  .header .byline {{ font-size: 0.85rem; color: var(--text2); margin: 0.2rem 0 0; }}
+  .header .meta {{ font-size: 0.75rem; color: var(--text2); margin-top: 0.5rem; }}
+  .nav {{
+    display: flex;
+    gap: 0.25rem;
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 0.25rem;
+  }}
+  .nav-link {{
+    padding: 0.4rem 1rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text2);
+    text-decoration: none;
+    transition: all 0.2s;
+  }}
+  .nav-link:hover {{ color: var(--text); background: rgba(255,255,255,0.05); }}
+  .nav-link.active {{ color: var(--text); background: var(--accent); }}
+  .container {{
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 1.5rem 2.5rem 3rem;
+  }}
+  .filter-toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 1.5rem;
+    padding: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }}
+  .filter-toolbar input[type="text"] {{
+    flex: 1;
+    min-width: 200px;
+    padding: 0.5rem 0.75rem;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+    outline: none;
+  }}
+  .filter-toolbar input[type="text"]:focus {{
+    border-color: var(--accent);
+  }}
+  .filter-toolbar select {{
+    padding: 0.5rem 0.75rem;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }}
+  .filter-toolbar .filter-count {{
+    font-size: 0.8rem;
+    color: var(--text2);
+    margin-left: auto;
+  }}
+  .prompt-section {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 0.75rem;
+    overflow: hidden;
+  }}
+  .prompt-toggle {{
+    padding: 0.75rem 1.25rem;
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }}
+  .prompt-toggle::-webkit-details-marker {{ display: none; }}
+  .prompt-toggle::before {{
+    content: '\\25B6';
+    font-size: 0.6rem;
+    color: var(--text2);
+    transition: transform 0.2s;
+  }}
+  details.prompt-section[open] .prompt-toggle::before {{
+    transform: rotate(90deg);
+  }}
+  .prompt-toggle .pid {{
+    font-weight: 700;
+    font-size: 0.8rem;
+    color: var(--accent);
+    background: rgba(108,114,255,0.1);
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-family: monospace;
+  }}
+  .prompt-toggle .pcat {{
+    font-size: 0.75rem;
+    color: var(--text2);
+    text-transform: capitalize;
+  }}
+  .prompt-toggle .pdiff {{
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }}
+  .prompt-toggle .ptext {{
+    font-size: 0.8rem;
+    color: var(--text2);
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 200px;
+  }}
+  .prompt-body {{
+    padding: 0 1.25rem 1rem;
+  }}
+  .prompt-body table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }}
+  .prompt-body th {{
+    text-align: left;
+    padding: 0.5rem 0.75rem;
+    border-bottom: 2px solid var(--border);
+    color: var(--text2);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }}
+  .prompt-body th.num {{ text-align: right; }}
+  .prompt-body td {{
+    padding: 0.5rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }}
+  .prompt-body td.num {{ text-align: right; }}
+  .prompt-body tr:last-child td {{ border-bottom: none; }}
+  .prompt-body tr:hover td {{ background: var(--surface2); }}
+  @media (max-width: 900px) {{
+    .header {{ padding: 1rem; }}
+    .header-top {{ flex-direction: column; align-items: flex-start; gap: 0.5rem; }}
+    .container {{ padding: 1rem; }}
+  }}
+  @media (max-width: 600px) {{
+    .container {{ padding: 0.75rem; }}
+    .header {{ padding: 1rem 0.75rem; }}
+    .header h1 {{ font-size: 1.2rem; }}
+  }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-inner">
+    <div class="header-top">
+      <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
+      {nav_html}
+    </div>
+    <p class="byline">Opinionated in scope. Objective in execution.</p>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+  </div>
+</div>
+
+<div class="container">
+
+<div class="filter-toolbar">
+  <input type="text" id="search-input" placeholder="Search prompts...">
+  <select id="filter-category">
+    <option value="">All Categories</option>
+  </select>
+  <select id="filter-difficulty">
+    <option value="">All Difficulties</option>
+    <option value="easy">Easy</option>
+    <option value="medium">Medium</option>
+    <option value="hard">Hard</option>
+  </select>
+  <span class="filter-count" id="filter-count"></span>
+</div>
+
+<div id="prompts-container"></div>
+
+</div>
+
+<script>
+const DATA = {data_json};
+const prompts = DATA.prompt_results;
+const diffColors = {{ easy: '#22c55e', medium: '#eab308', hard: '#ef4444' }};
+
+function scoreColor(s) {{
+  if (s == null) return 'color:var(--text2)';
+  if (s >= 0.8) return 'color:#22c55e';
+  if (s >= 0.6) return 'color:#86efac';
+  if (s >= 0.4) return 'color:#eab308';
+  if (s >= 0.2) return 'color:#f97316';
+  return 'color:#ef4444';
+}}
+
+function judgeColor(s) {{
+  if (s == null) return 'color:var(--text2)';
+  if (s >= 4.5) return 'color:#22c55e';
+  if (s >= 3.5) return 'color:#86efac';
+  if (s >= 2.5) return 'color:#eab308';
+  if (s >= 1.5) return 'color:#f97316';
+  return 'color:#ef4444';
+}}
+
+// Populate category dropdown
+const catSel = document.getElementById('filter-category');
+DATA.categories.forEach(c => {{
+  const opt = document.createElement('option');
+  opt.value = c;
+  opt.textContent = c.replace(/_/g, ' ');
+  opt.style.textTransform = 'capitalize';
+  catSel.appendChild(opt);
+}});
+
+// Render prompts
+const container = document.getElementById('prompts-container');
+
+prompts.forEach(p => {{
+  const section = document.createElement('details');
+  section.className = 'prompt-section';
+  section.dataset.category = p.category;
+  section.dataset.difficulty = p.difficulty;
+
+  const diffColor = diffColors[p.difficulty] || 'var(--text2)';
+
+  // Build model comparison table rows sorted by composite-like score
+  const modelEntries = Object.entries(p.models || {{}});
+  modelEntries.sort((a, b) => {{
+    const sa = (a[1].judge_score != null && a[1].deepeval_avg != null)
+      ? 0.5 * (a[1].judge_score - 1) / 4 + 0.5 * a[1].deepeval_avg
+      : (a[1].judge_score != null ? (a[1].judge_score - 1) / 4 : (a[1].deepeval_avg || 0));
+    const sb = (b[1].judge_score != null && b[1].deepeval_avg != null)
+      ? 0.5 * (b[1].judge_score - 1) / 4 + 0.5 * b[1].deepeval_avg
+      : (b[1].judge_score != null ? (b[1].judge_score - 1) / 4 : (b[1].deepeval_avg || 0));
+    return sb - sa;
+  }});
+
+  let rows = '';
+  modelEntries.forEach(([name, d]) => {{
+    if (d.error) {{
+      rows += '<tr><td style="font-weight:600">' + name + '</td><td class="num" style="color:var(--red)">Error</td><td class="num">-</td><td class="num">-</td><td class="num">-</td></tr>';
+      return;
+    }}
+    const js = d.judge_score;
+    const da = d.deepeval_avg;
+    const jsStr = js != null ? js + '/5' : '-';
+    const daStr = da != null ? da.toFixed(2) : '-';
+    const flags = d.flags && d.flags.length ? '<span style="color:var(--yellow)">' + d.flags.join(', ') + '</span>' : '-';
+    rows += '<tr><td style="font-weight:600">' + name + '</td>' +
+      '<td class="num" style="font-weight:600;' + judgeColor(js) + '">' + jsStr + '</td>' +
+      '<td class="num" style="font-weight:600;' + scoreColor(da) + '">' + daStr + '</td>' +
+      '<td class="num">' + d.latency_s + 's</td>' +
+      '<td class="num">' + flags + '</td></tr>';
+  }});
+
+  const truncText = p.prompt_text.length > 120 ? p.prompt_text.substring(0, 120) + '...' : p.prompt_text;
+
+  section.innerHTML = `
+    <summary class="prompt-toggle">
+      <span class="pid">${{p.id}}</span>
+      <span class="pcat">${{p.category.replace(/_/g, ' ')}}</span>
+      <span class="pdiff" style="color:${{diffColor}}">${{p.difficulty}}</span>
+      <span class="ptext">${{truncText}}</span>
+    </summary>
+    <div class="prompt-body">
+      <table>
+        <thead><tr><th>Model</th><th class="num">Judge</th><th class="num">DeepEval</th><th class="num">Latency</th><th class="num">Flags</th></tr></thead>
+        <tbody>${{rows}}</tbody>
+      </table>
+    </div>
+  `;
+
+  container.appendChild(section);
+}});
+
+// Filters
+const searchInput = document.getElementById('search-input');
+const diffFilter = document.getElementById('filter-difficulty');
+const countDisplay = document.getElementById('filter-count');
+const total = prompts.length;
+countDisplay.textContent = total + ' of ' + total + ' shown';
+
+function applyFilters() {{
+  const query = searchInput.value.toLowerCase();
+  const cat = catSel.value;
+  const diff = diffFilter.value;
+  let shown = 0;
+  document.querySelectorAll('.prompt-section').forEach(s => {{
+    const matchCat = !cat || s.dataset.category === cat;
+    const matchDiff = !diff || s.dataset.difficulty === diff;
+    const matchText = !query || s.textContent.toLowerCase().includes(query);
+    const visible = matchCat && matchDiff && matchText;
+    s.style.display = visible ? '' : 'none';
+    if (visible) shown++;
+  }});
+  countDisplay.textContent = shown + ' of ' + total + ' shown';
+}}
+
+searchInput.addEventListener('input', applyFilters);
+catSel.addEventListener('change', applyFilters);
+diffFilter.addEventListener('change', applyFilters);
+</script>
 
 </body>
 </html>"""
@@ -2054,7 +3519,8 @@ def generate_dashboard(output_path=None):
 
     prompts = load_prompts()
     composite_config = config.get("composite", {})
-    stats = compute_stats(models, prompts, judge_model=judge_model, composite_config=composite_config)
+    models_cfg = config.get("models", {})
+    stats = compute_stats(models, prompts, judge_model=judge_model, composite_config=composite_config, models_cfg=models_cfg)
 
     # Ensure output directory exists
     out_dir = os.path.dirname(output_path)
@@ -2072,11 +3538,23 @@ def generate_dashboard(output_path=None):
     with open(cat_path, "w") as f:
         f.write(cat_html)
 
+    # Companies page
+    companies_path = os.path.join(out_dir or ".", "companies.html")
+    companies_html = generate_companies_html(stats)
+    with open(companies_path, "w") as f:
+        f.write(companies_html)
+
     # Methodology page
     meth_path = os.path.join(out_dir or ".", "methodology.html")
     meth_html = generate_methodology_html(stats)
     with open(meth_path, "w") as f:
         f.write(meth_html)
+
+    # Prompts page
+    prompts_path = os.path.join(out_dir or ".", "prompts.html")
+    prompts_html = generate_prompts_html(stats)
+    with open(prompts_path, "w") as f:
+        f.write(prompts_html)
 
     return output_path
 
@@ -2086,5 +3564,7 @@ if __name__ == "__main__":
     if path:
         out_dir = os.path.dirname(path) or "."
         print(f"Dashboard generated: {path}")
+        print(f"Companies page generated: {os.path.join(out_dir, 'companies.html')}")
         print(f"Categories page generated: {os.path.join(out_dir, 'categories.html')}")
-        print(f"Index redirect generated: {os.path.join(out_dir, 'index.html')}")
+        print(f"Methodology page generated: {os.path.join(out_dir, 'methodology.html')}")
+        print(f"Prompts page generated: {os.path.join(out_dir, 'prompts.html')}")

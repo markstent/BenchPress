@@ -69,7 +69,7 @@ class OpenAIProvider(Provider):
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=120,
+            timeout=300,
         )
 
     def complete(self, prompt: str, params: dict) -> tuple[str, dict]:
@@ -164,6 +164,42 @@ class OllamaProvider(Provider):
         return content, usage
 
 
+class CohereProvider(Provider):
+    def __init__(self, model: str, api_key: str):
+        self.model = model
+        self.client = httpx.Client(
+            base_url="https://api.cohere.com",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=120,
+        )
+
+    def complete(self, prompt: str, params: dict) -> tuple[str, dict]:
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        if "max_tokens" in params:
+            body["max_tokens"] = params["max_tokens"]
+        if "temperature" in params:
+            body["temperature"] = params["temperature"]
+        resp = self.client.post("/v2/chat", json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        try:
+            content = data["message"]["content"][0]["text"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"Unexpected {self.model} response structure: {e}") from e
+        usage = {
+            "input_tokens": data.get("usage", {}).get("tokens", {}).get("input_tokens"),
+            "output_tokens": data.get("usage", {}).get("tokens", {}).get("output_tokens"),
+        }
+        return content, usage
+
+
 class BedrockProvider(Provider):
     def __init__(self, model: str, region: str = None):
         import boto3
@@ -217,5 +253,7 @@ def get_provider(config: dict) -> Provider:
         return OpenAIProvider(config["model"], api_key, base_url)
     elif provider_type == "google":
         return GoogleProvider(config["model"], api_key)
+    elif provider_type == "cohere":
+        return CohereProvider(config["model"], api_key)
     else:
         raise ValueError(f"Unknown provider: {provider_type}")
