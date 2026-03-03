@@ -160,15 +160,69 @@ Every response gets automated checks that flag mechanical issues. 19 active chec
 | `multi_step_verify` | Expected numeric answer not found |
 | `statistical_significance` | Overclaims statistical significance |
 
+## Models Evaluated
+
+44 models across 14 companies, tested on all 80 prompts.
+
+| Model | Company | Launched |
+|---|---|---|
+| claude-opus-4.6 | Anthropic | 2026-01-28 |
+| claude-sonnet-4.6 | Anthropic | 2026-01-28 |
+| claude-opus-4.5 | Anthropic | 2025-11-01 |
+| claude-haiku-4.5 | Anthropic | 2025-10-01 |
+| claude-sonnet-4.5 | Anthropic | 2025-09-29 |
+| claude-opus-4 | Anthropic | 2025-05-14 |
+| claude-sonnet-4 | Anthropic | 2025-05-14 |
+| claude-sonnet-3.7 | Anthropic | 2025-02-19 |
+| claude-haiku-3 | Anthropic | 2024-03-07 |
+| gpt-5.2 | OpenAI | 2025-12-01 |
+| gpt-oss-120b | OpenAI | 2025-07-01 |
+| gpt-oss-20b | OpenAI | 2025-07-01 |
+| o3-mini | OpenAI | 2025-01-31 |
+| o4-mini | OpenAI | 2025-04-16 |
+| gpt-4.1-mini | OpenAI | 2025-04-14 |
+| gpt-4.1-nano | OpenAI | 2025-04-14 |
+| gpt-4o | OpenAI | 2024-05-13 |
+| gpt-4o-mini | OpenAI | 2024-07-18 |
+| gemini-3.1-pro | Google | 2026-01-01 |
+| gemini-3-pro | Google | 2025-09-01 |
+| gemini-3-flash | Google | 2025-09-01 |
+| gemini-2.5-pro | Google | 2025-03-25 |
+| gemini-2.5-flash | Google | 2025-05-20 |
+| gemma-3-27b | Google | 2025-03-12 |
+| grok-4.1-fast | xAI | 2025-10-01 |
+| grok-4 | xAI | 2025-07-09 |
+| llama-4-scout | Meta | 2025-04-05 |
+| llama-4-maverick | Meta | 2025-04-05 |
+| llama3.2 | Meta | 2024-09-25 |
+| llama3.2-vision-11b | Meta | 2024-09-25 |
+| llama3.1 | Meta | 2024-07-23 |
+| qwen3-235b | Alibaba | 2025-07-01 |
+| qwen3-coder-30b | Alibaba | 2025-07-01 |
+| qwen3-32b | Alibaba | 2025-04-29 |
+| minimax-m2.5 | MiniMax | 2025-10-01 |
+| kimi-k2.5 | Moonshot | 2025-10-01 |
+| glm-5 | Zhipu | 2025-10-01 |
+| glm-4.7-flash | Zhipu | 2025-06-01 |
+| mistral-large-3 | Mistral | 2025-03-01 |
+| codestral | Mistral | 2024-05-29 |
+| command-a | Cohere | 2025-03-01 |
+| nova-2-lite | Amazon | 2025-06-01 |
+| nova-pro | Amazon | 2024-12-03 |
+| nova-lite | Amazon | 2024-12-03 |
+| nova-micro | Amazon | 2024-12-03 |
+
 ## Adding Models
 
-Any OpenAI-compatible API works (vLLM, Ollama, Together, Groq, etc.):
+Any OpenAI-compatible API works (vLLM, Ollama, Together, Groq, HF Inference API, etc.):
 
 ```yaml
 # In config.yaml
 llama-3-70b:
   provider: openai_compatible
   model: meta-llama/Llama-3-70b
+  company: Meta
+  launch_date: "2024-04-18"
   api_key_env: none
   base_url: http://localhost:8000/v1
   params:
@@ -176,7 +230,7 @@ llama-3-70b:
     temperature: 0
 ```
 
-Supported providers: `anthropic`, `openai`, `google`, `ollama`, `bedrock`, `openai_compatible`.
+Supported providers: `anthropic`, `openai`, `google`, `ollama`, `bedrock`, `cohere`, `openai_compatible`.
 
 ## Adding Prompts
 
@@ -207,7 +261,7 @@ llm-eval/
 ├── evals/
 │   └── default.json             # 80 eval prompts across 8 categories
 ├── scripts/
-│   ├── providers.py             # Anthropic, OpenAI, Google, Ollama, OpenAI-compatible
+│   ├── providers.py             # Anthropic, OpenAI, Google, Ollama, Bedrock, Cohere, OpenAI-compatible
 │   ├── checks.py                # 19 automated response checkers
 │   ├── judge.py                 # LLM-as-judge scoring (1-5)
 │   ├── deepeval_scorer.py       # DeepEval G-Eval integration (0-1)
@@ -215,6 +269,8 @@ llm-eval/
 ├── docs/                        # Generated dashboard pages (GitHub Pages)
 │   ├── index.html
 │   ├── categories.html
+│   ├── companies.html
+│   ├── prompts.html
 │   └── methodology.html
-└── results/                     # Per-model JSON files (git-ignored)
+└── results/                     # Per-model JSON files (tracked in git)
 ```
