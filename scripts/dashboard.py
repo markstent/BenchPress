@@ -49,7 +49,7 @@ def latest_run(model_data, pid):
     return runs[-1] if runs else {}
 
 
-def compute_stats(models, prompts, judge_model=None, composite_config=None, models_cfg=None):
+def compute_stats(models, prompts, judge_models=None, composite_config=None, models_cfg=None):
     """Compute all stats needed for the dashboard."""
     judge_weight = (composite_config or {}).get("judge_weight", 0.5)
     deepeval_weight = (composite_config or {}).get("deepeval_weight", 0.5)
@@ -74,8 +74,8 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
             if run.get("error"):
                 errors += 1
                 continue
-            if run.get("judge_score") is not None:
-                scores.append(run["judge_score"])
+            if run.get("judge_score_avg") is not None:
+                scores.append(run["judge_score_avg"])
             if run.get("auto_checks", {}).get("flags"):
                 flagged += 1
             latencies.append(run.get("latency_s", 0))
@@ -102,9 +102,9 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
         cat_composite = {}
         for cat in categories:
             cs = [
-                runs_cache[pid].get("judge_score")
+                runs_cache[pid].get("judge_score_avg")
                 for pid in cat_pids[cat]
-                if runs_cache[pid] and runs_cache[pid].get("judge_score") is not None
+                if runs_cache[pid] and runs_cache[pid].get("judge_score_avg") is not None
             ]
             cat_scores[cat] = round(sum(cs) / len(cs), 2) if cs else None
             # DeepEval per-category average
@@ -132,9 +132,9 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
         diff_composite = {}
         for d in difficulties:
             ds = [
-                runs_cache[pid].get("judge_score")
+                runs_cache[pid].get("judge_score_avg")
                 for pid in diff_pids[d]
-                if runs_cache[pid] and runs_cache[pid].get("judge_score") is not None
+                if runs_cache[pid] and runs_cache[pid].get("judge_score_avg") is not None
             ]
             diff_scores[d] = round(sum(ds) / len(ds), 2) if ds else None
             d_de = [
@@ -159,10 +159,32 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
         for pid in pids:
             run = runs_cache[pid]
             if run and not run.get("error"):
-                js, da = run.get("judge_score"), run.get("deepeval_avg")
+                js, da = run.get("judge_score_avg"), run.get("deepeval_avg")
                 if js is not None and da is not None:
                     divergences.append(abs((js - 1) / 4 - da))
         avg_divergence = round(sum(divergences) / len(divergences), 4) if divergences else None
+
+        # Per-judge score breakdown
+        judge_breakdown = {}
+        for pid in pids:
+            run = runs_cache[pid]
+            if not run or run.get("error"):
+                continue
+            for jname, jdata in run.get("judge_scores", {}).items():
+                if jname not in judge_breakdown:
+                    judge_breakdown[jname] = []
+                if jdata.get("score") is not None:
+                    judge_breakdown[jname].append(jdata["score"])
+        judge_averages = {}
+        for jname, jscores in judge_breakdown.items():
+            judge_averages[jname] = round(sum(jscores) / len(jscores), 2) if jscores else None
+        # Judge agreement (std dev)
+        ja_values = [v for v in judge_averages.values() if v is not None]
+        if len(ja_values) >= 2:
+            mean_ja = sum(ja_values) / len(ja_values)
+            judge_std_dev = round((sum((x - mean_ja) ** 2 for x in ja_values) / len(ja_values)) ** 0.5, 2)
+        else:
+            judge_std_dev = None
 
         # Score distribution
         dist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
@@ -231,6 +253,8 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
             "diff_deepeval": diff_deepeval,
             "diff_composite": diff_composite,
             "avg_divergence": avg_divergence,
+            "judge_averages": judge_averages,
+            "judge_std_dev": judge_std_dev,
         })
 
     leaderboard.sort(key=lambda x: (x["scored"] > 0, x["composite_score"] or 0), reverse=True)
@@ -267,7 +291,9 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
             run = latest_run(data, p["id"])
             if run and not run.get("error"):
                 pr["models"][name] = {
-                    "judge_score": run.get("judge_score"),
+                    "judge_score": run.get("judge_score_avg"),
+                    "judge_scores": run.get("judge_scores", {}),
+                    "judge_count": run.get("judge_count", 0),
                     "deepeval_avg": run.get("deepeval_avg"),
                     "latency_s": round(run.get("latency_s", 0), 1),
                     "error": False,
@@ -290,7 +316,7 @@ def compute_stats(models, prompts, judge_model=None, composite_config=None, mode
         "flags": flags,
         "total_prompts": len(pids),
         "total_models": len(models),
-        "judge_model": judge_model,
+        "judge_models": judge_models or [],
         "generated": datetime.now().isoformat(),
         "difficulties": difficulties,
         "prompt_results": prompt_results,
@@ -724,7 +750,7 @@ def generate_html(stats):
       </nav>
     </div>
     <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
@@ -1054,7 +1080,7 @@ new Chart(document.getElementById('distChart'), {{
 
       th.classList.add(dir);
 
-      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const rows = Array.from(tbody.querySelectorAll('tr.model-row'));
       rows.sort((a, b) => {{
         let va = a.dataset[key];
         let vb = b.dataset[key];
@@ -1066,9 +1092,25 @@ new Chart(document.getElementById('distChart'), {{
           return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
         }}
       }});
-      rows.forEach(r => tbody.appendChild(r));
+      rows.forEach(r => {{
+        tbody.appendChild(r);
+        // Re-attach detail row after its parent
+        const detail = tbody.querySelector('tr.judge-detail-row[data-parent="' + r.dataset.name + '"]');
+        if (detail) tbody.appendChild(detail);
+      }});
       setParams({{ sort: key, dir: dir }});
     }});
+  }});
+
+  // Click to expand judge detail rows
+  tbody.addEventListener('click', function(e) {{
+    const row = e.target.closest('tr.model-row');
+    if (!row) return;
+    const name = row.dataset.name;
+    const detail = tbody.querySelector('tr.judge-detail-row[data-parent="' + name + '"]');
+    if (detail) {{
+      detail.style.display = detail.style.display === 'none' ? '' : 'none';
+    }}
   }});
 }})();
 
@@ -1097,9 +1139,12 @@ function setParams(obj) {{
   }});
 
   function filterByCompany(val) {{
-    const rows = document.querySelectorAll('#leaderboard-table tbody tr');
+    const rows = document.querySelectorAll('#leaderboard-table tbody tr.model-row');
     rows.forEach(r => {{
-      r.style.display = (!val || r.dataset.company === val) ? '' : 'none';
+      const show = !val || r.dataset.company === val;
+      r.style.display = show ? '' : 'none';
+      const detail = document.querySelector('tr.judge-detail-row[data-parent="' + r.dataset.name + '"]');
+      if (detail) detail.style.display = 'none';
     }});
   }}
 
@@ -1128,7 +1173,7 @@ function setParams(obj) {{
       th.classList.add(dir);
       const tbody = document.querySelector('#leaderboard-table tbody');
       const type = th.dataset.type;
-      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const rows = Array.from(tbody.querySelectorAll('tr.model-row'));
       rows.sort((a, b) => {{
         let va = a.dataset[params.sort];
         let vb = b.dataset[params.sort];
@@ -1140,7 +1185,11 @@ function setParams(obj) {{
           return dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
         }}
       }});
-      rows.forEach(r => tbody.appendChild(r));
+      rows.forEach(r => {{
+        tbody.appendChild(r);
+        const detail = tbody.querySelector('tr.judge-detail-row[data-parent="' + r.dataset.name + '"]');
+        if (detail) tbody.appendChild(detail);
+      }});
     }}
   }}
 }})();
@@ -1424,12 +1473,33 @@ def _leaderboard_row(i, m):
     div_data = f"{div_val}" if div_val is not None else "0"
     div_color = _divergence_color(div_val)
 
-    return f"""<tr data-rank="{i+1}" data-name="{m['name']}" data-company="{company}" data-composite="{comp_data}" data-score="{m['avg_score']}" data-deepeval="{de_data}" data-scored="{m['scored']}" data-de_scored="{m['de_scored']}" data-errors="{m['errors']}" data-flags="{m['flagged']}" data-latency="{m['avg_latency']}" data-tokens="{m['avg_tokens']}" data-efficiency="{m['efficiency']}" data-divergence="{div_data}">
+    # Judge agreement indicator
+    jsd = m.get("judge_std_dev")
+    if jsd is None or jsd < 0.3:
+        agree_color = "#22c55e"
+    elif jsd <= 0.7:
+        agree_color = "#eab308"
+    else:
+        agree_color = "#ef4444"
+    judge_count = len(m.get("judge_averages", {}))
+    agree_dot = f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{agree_color};margin-left:4px;vertical-align:middle" title="Judge std dev: {jsd}"></span>' if judge_count > 0 else ''
+
+    # Judge breakdown detail row
+    ja = m.get("judge_averages", {})
+    detail_cells = ""
+    if ja:
+        detail_cells = "".join(
+            f'<td style="padding:0.25rem 0.5rem;font-size:0.75rem;color:var(--text2)">{jn}: <strong>{jv:.2f}</strong>/5</td>'
+            for jn, jv in ja.items() if jv is not None
+        )
+    detail_row = f'<tr class="judge-detail-row" data-parent="{m["name"]}" style="display:none;background:var(--surface2)"><td></td><td colspan="13" style="padding:0.4rem 0.75rem;font-size:0.75rem"><span style="color:var(--text2)">Per-judge averages:</span> <table style="display:inline-table;border:none;margin-left:0.5rem"><tr>{detail_cells}</tr></table></td></tr>' if detail_cells else ''
+
+    return f"""<tr class="model-row" data-rank="{i+1}" data-name="{m['name']}" data-company="{company}" data-composite="{comp_data}" data-score="{m['avg_score']}" data-deepeval="{de_data}" data-scored="{m['scored']}" data-de_scored="{m['de_scored']}" data-errors="{m['errors']}" data-flags="{m['flagged']}" data-latency="{m['avg_latency']}" data-tokens="{m['avg_tokens']}" data-efficiency="{m['efficiency']}" data-divergence="{div_data}" style="cursor:pointer">
       <td><span class="rank {rank_cls}">{i+1}</span></td>
       <td style="font-weight:600">{m['name']}</td>
       <td style="color:var(--text2);font-size:0.8rem">{company}</td>
       <td class="num" style="font-weight:700;{comp_color}">{comp_str}</td>
-      <td class="num {sc}" style="font-weight:600">{m['avg_score']:.2f}/5</td>
+      <td class="num {sc}" style="font-weight:600" title="{judge_count} judge(s)">{m['avg_score']:.2f}/5{agree_dot}</td>
       <td class="num" style="font-weight:600;{de_color}">{de_str}</td>
       <td class="num col-detail">{m['scored']}/{m['total']}</td>
       <td class="num col-detail">{m['de_scored']}/{m['total']}</td>
@@ -1439,7 +1509,8 @@ def _leaderboard_row(i, m):
       <td class="num col-detail">{m['avg_tokens']:.0f}</td>
       <td class="num" style="font-weight:600;{_efficiency_color(m['efficiency'])}">{m['efficiency']:.2f}</td>
       <td class="num col-detail" style="font-weight:600;{div_color}">{div_str}</td>
-    </tr>"""
+    </tr>
+    {detail_row}"""
 
 
 def _category_row(cat, leaderboard):
@@ -1688,7 +1759,7 @@ def generate_categories_html(stats):
       </nav>
     </div>
     <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
@@ -2101,7 +2172,7 @@ def generate_companies_html(stats):
       </nav>
     </div>
     <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
@@ -2852,7 +2923,7 @@ def generate_methodology_html(stats):
       </nav>
     </div>
     <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
@@ -3347,7 +3418,7 @@ def generate_prompts_html(stats):
       {nav_html}
     </div>
     <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judged by {stats["judge_model"]}' if stats.get("judge_model") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
@@ -3438,8 +3509,22 @@ prompts.forEach(p => {{
     const jsStr = js != null ? js + '/5' : '-';
     const daStr = da != null ? da.toFixed(2) : '-';
     const flags = d.flags && d.flags.length ? '<span style="color:var(--yellow)">' + d.flags.join(', ') + '</span>' : '-';
+    // Per-judge score breakdown
+    let judgeDetail = '';
+    const jScores = d.judge_scores || {{}};
+    const judgeNames = Object.keys(jScores);
+    if (judgeNames.length > 0) {{
+      judgeDetail = '<div style="font-size:0.7rem;color:var(--text2);margin-top:2px">';
+      judgeNames.forEach((jn, idx) => {{
+        const jd = jScores[jn];
+        const sc = jd && jd.score != null ? jd.score + '/5' : '-';
+        judgeDetail += (idx > 0 ? ' &middot; ' : '') + jn + ': ' + sc;
+      }});
+      judgeDetail += '</div>';
+    }}
+    const judgeCountTip = d.judge_count ? d.judge_count + ' judge(s)' : '';
     rows += '<tr><td style="font-weight:600">' + name + '</td>' +
-      '<td class="num" style="font-weight:600;' + judgeColor(js) + '">' + jsStr + '</td>' +
+      '<td class="num" style="font-weight:600;' + judgeColor(js) + '" title="' + judgeCountTip + '">' + jsStr + judgeDetail + '</td>' +
       '<td class="num" style="font-weight:600;' + scoreColor(da) + '">' + daStr + '</td>' +
       '<td class="num">' + d.latency_s + 's</td>' +
       '<td class="num">' + flags + '</td></tr>';
@@ -3511,16 +3596,14 @@ def generate_dashboard(output_path=None):
         print("No model results found.")
         return None
 
-    # Determine judge model and exclude from leaderboard
     config = load_config()
-    judge_model = config.get("judge", {}).get("model")
-    if judge_model and judge_model in models:
-        del models[judge_model]
+    judges_cfg = config.get("judges", [])
+    judge_models = [j["model"] for j in judges_cfg]
 
     prompts = load_prompts()
     composite_config = config.get("composite", {})
     models_cfg = config.get("models", {})
-    stats = compute_stats(models, prompts, judge_model=judge_model, composite_config=composite_config, models_cfg=models_cfg)
+    stats = compute_stats(models, prompts, judge_models=judge_models, composite_config=composite_config, models_cfg=models_cfg)
 
     # Ensure output directory exists
     out_dir = os.path.dirname(output_path)
