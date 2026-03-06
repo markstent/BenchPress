@@ -735,6 +735,74 @@ def cmd_deepeval(args):
         print(f"  Dashboard updated: {path}")
 
 
+def cmd_migrate_judges(args):
+    """Migrate result files from single-judge to multi-judge format."""
+    import shutil
+
+    models = list_evaluated_models()
+    if not models:
+        print("No result files found.")
+        return
+
+    # Back up all result files before modifying
+    backup_dir = os.path.join(RESULTS_DIR, "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    for model in models:
+        src = model_path(model)
+        dst = os.path.join(backup_dir, f"{model}.json")
+        shutil.copy2(src, dst)
+    print(f"Backed up {len(models)} result files to {backup_dir}/")
+
+    total_migrated = 0
+    total_skipped = 0
+
+    for model in models:
+        data = load_model_results(model)
+        changed = False
+
+        for prompt_id, runs in data.get("runs", {}).items():
+            for run in runs:
+                # Skip if already migrated
+                if "judge_scores" in run:
+                    total_skipped += 1
+                    continue
+
+                old_score = run.get("judge_score")
+                old_rationale = run.get("judge_rationale")
+                old_model = run.get("judge_model")
+
+                # Nothing to migrate if no old judge data
+                if old_score is None and old_rationale is None and old_model is None:
+                    total_skipped += 1
+                    continue
+
+                # Build new multi-judge structure
+                judge_key = old_model or "unknown"
+                run["judge_scores"] = {
+                    judge_key: {
+                        "score": old_score,
+                        "rationale": old_rationale,
+                        "judged_at": None,
+                    }
+                }
+                run["judge_score_avg"] = float(old_score) if old_score is not None else None
+                run["judge_count"] = 1 if old_score is not None else 0
+
+                # Remove old fields
+                run.pop("judge_score", None)
+                run.pop("judge_rationale", None)
+                run.pop("judge_model", None)
+
+                changed = True
+                total_migrated += 1
+
+        if changed:
+            save_model_results(model, data)
+            print(f"  Migrated: {model}")
+
+    print(f"\nDone: {total_migrated} entries migrated, {total_skipped} skipped")
+
+
 def cmd_dashboard(args):
     path = generate_dashboard(args.output if hasattr(args, "output") else None)
     if path:
@@ -783,12 +851,14 @@ def main():
     p.add_argument("--ids", nargs="+", help="Only score specific prompt IDs")
     p.add_argument("--force", action="store_true", help="Re-score even if already has DeepEval scores")
 
+    p = sub.add_parser("migrate-judges", help="Migrate results from single-judge to multi-judge format")
+
     p = sub.add_parser("dashboard", help="Generate HTML dashboard")
     p.add_argument("--output", default=None, help="Output file path")
     p.add_argument("--open", action="store_true", help="Open in browser")
 
     args = parser.parse_args()
-    cmds = {"eval": cmd_eval, "compare": cmd_compare, "models": cmd_models, "prompts": cmd_prompts, "rejudge": cmd_rejudge, "deepeval": cmd_deepeval, "dashboard": cmd_dashboard}
+    cmds = {"eval": cmd_eval, "compare": cmd_compare, "models": cmd_models, "prompts": cmd_prompts, "rejudge": cmd_rejudge, "deepeval": cmd_deepeval, "migrate-judges": cmd_migrate_judges, "dashboard": cmd_dashboard}
     fn = cmds.get(args.command)
     if fn:
         fn(args)
