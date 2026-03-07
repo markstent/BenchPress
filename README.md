@@ -7,6 +7,8 @@
 ![Tests 168](https://img.shields.io/badge/tests-168-brightgreen)
 ![Models 48](https://img.shields.io/badge/models-48-orange)
 
+![View live leaderboard\(https://markstent.github.io/BenchPress/)
+
 BenchPress runs 80 prompts across 8 categories against any LLM and scores every response through three independent layers: deterministic auto-checks, multi-judge LLM scoring (1-5), and DeepEval G-Eval metrics (0-1). Results persist as JSON, so when a new model drops, one command compares it against everything tested before.
 
 The prompt set is deliberately opinionated - trap questions that tempt hallucination, false premises that reward pushback over agreement, constraint-heavy tasks that punish verbosity, and coding problems with no bug to find. The kind of stuff that separates models that are actually useful from models that just benchmark well.
