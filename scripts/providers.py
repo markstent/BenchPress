@@ -94,8 +94,8 @@ class OpenAIProvider(Provider):
 
     def complete(self, prompt: str, params: dict) -> tuple[str, dict]:
         p = dict(params)
-        # OpenAI reasoning models (o-series) don't support temperature
-        if self.model.startswith(("o1", "o3", "o4")):
+        # OpenAI reasoning models (o-series, gpt-5) don't support temperature
+        if self.model.startswith(("o1", "o3", "o4", "gpt-5.3")) or self.model == "gpt-5":
             p.pop("temperature", None)
         # Newer OpenAI models require max_completion_tokens instead of max_tokens
         if "max_tokens" in p and self.model.startswith(("gpt-5", "gpt-4.1", "o1", "o3", "o4")):

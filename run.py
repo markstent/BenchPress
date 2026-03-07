@@ -554,6 +554,7 @@ def cmd_rejudge(args):
 
         pids = list(model_data["runs"].keys())
         changed = False
+        judges_needed_by_pid = {}
 
         for pid in pids:
             runs = model_data.get("runs", {}).get(pid, [])
@@ -582,6 +583,7 @@ def cmd_rejudge(args):
             if not judges_needed:
                 continue
 
+            judges_needed_by_pid[pid] = judges_needed
             auto_checks = run.get("auto_checks", {"flags": [], "auto_scores": {}, "passed": True})
 
             for jname in judges_needed:
@@ -617,7 +619,25 @@ def cmd_rejudge(args):
 
         if changed:
             try:
-                save_model_results(model_name, model_data)
+                # Re-read file to avoid clobbering scores written by concurrent processes
+                fresh_data = load_model_results(model_name)
+                for pid in model_data["runs"]:
+                    fresh_runs = fresh_data.get("runs", {}).get(pid, [])
+                    if not fresh_runs:
+                        continue
+                    fresh_run = fresh_runs[-1]
+                    if "judge_scores" not in fresh_run:
+                        fresh_run["judge_scores"] = {}
+                    # Merge our judge scores into the fresh data
+                    source_run = model_data["runs"][pid][-1]
+                    for jname, jdata in source_run.get("judge_scores", {}).items():
+                        if jname in judges_needed_by_pid.get(pid, []):
+                            fresh_run["judge_scores"][jname] = jdata
+                    # Recompute aggregates
+                    valid = [v["score"] for v in fresh_run["judge_scores"].values() if isinstance(v, dict) and v.get("score") is not None]
+                    fresh_run["judge_score_avg"] = round(sum(valid) / len(valid), 2) if valid else None
+                    fresh_run["judge_count"] = len(valid)
+                save_model_results(model_name, fresh_data)
             except Exception as e:
                 print(f"    Save failed: {e}")
 

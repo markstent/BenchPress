@@ -97,15 +97,18 @@ def parse_judge_response(raw: str) -> dict:
     """
     text = raw.strip()
 
-    # Strip markdown code fences if present
-    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    if fence_match:
-        text = fence_match.group(1).strip()
-
-    # Try to find JSON object in text
+    # Try to find JSON object directly first (handles backticks inside values)
     extracted = _extract_json_object(text)
     if extracted:
         text = extracted
+    else:
+        # Fall back to stripping markdown code fences wrapping the response
+        fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+            extracted = _extract_json_object(text)
+            if extracted:
+                text = extracted
 
     try:
         parsed = json.loads(text)

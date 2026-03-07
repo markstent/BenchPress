@@ -62,11 +62,19 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
 
     leaderboard = []
     for name, data in models.items():
-        scores, latencies, tokens, errors = [], [], [], 0
+        latencies, tokens, errors = [], [], 0
         flagged = 0
         de_scores_all = {"correctness": [], "coherence": [], "instruction_following": []}
         de_avgs = []
         runs_cache = {pid: latest_run(data, pid) for pid in pids}
+
+        # Per-judge score breakdown (compute first - used for avg_score)
+        judge_breakdown = {}
+        judge_cat_breakdown = {cat: {} for cat in categories}
+        judge_diff_breakdown = {d: {} for d in difficulties}
+        pid_to_cat = {p["id"]: p["category"] for p in prompts}
+        pid_to_diff = {p["id"]: p["difficulty"] for p in prompts}
+
         for pid in pids:
             run = runs_cache[pid]
             if not run:
@@ -74,8 +82,6 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             if run.get("error"):
                 errors += 1
                 continue
-            if run.get("judge_score_avg") is not None:
-                scores.append(run["judge_score_avg"])
             if run.get("auto_checks", {}).get("flags"):
                 flagged += 1
             latencies.append(run.get("latency_s", 0))
@@ -89,24 +95,60 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             de_avg = run.get("deepeval_avg")
             if de_avg is not None:
                 de_avgs.append(de_avg)
+            # Collect per-judge scores (global, per-category, per-difficulty)
+            for jname, jdata in run.get("judge_scores", {}).items():
+                if jdata.get("score") is not None:
+                    sc = jdata["score"]
+                    judge_breakdown.setdefault(jname, []).append(sc)
+                    cat = pid_to_cat.get(pid)
+                    if cat:
+                        judge_cat_breakdown[cat].setdefault(jname, []).append(sc)
+                    diff = pid_to_diff.get(pid)
+                    if diff:
+                        judge_diff_breakdown[diff].setdefault(jname, []).append(sc)
+
+        judge_averages = {}
+        for jname, jscores in judge_breakdown.items():
+            judge_averages[jname] = round(sum(jscores) / len(jscores), 2) if jscores else None
+
+        # Count scorable prompts (non-error runs)
+        scorable = sum(1 for pid in pids if runs_cache[pid] and not runs_cache[pid].get("error"))
+
+        # Only include judges with complete coverage (scored every scorable prompt)
+        complete_judges = {
+            jname: javg for jname, javg in judge_averages.items()
+            if javg is not None and len(judge_breakdown[jname]) >= scorable
+        }
+
+        # avg_score = mean of complete judges only (fair comparison)
+        cj_values = list(complete_judges.values())
+        avg_s = sum(cj_values) / len(cj_values) if cj_values else 0
+        scored_count = scorable
 
         total = sum(1 for pid in pids if runs_cache[pid])
-        avg_s = sum(scores) / len(scores) if scores else 0
         avg_l = sum(latencies) / len(latencies) if latencies else 0
         avg_t = sum(tokens) / len(tokens) if tokens else 0
         median_l = sorted(latencies)[len(latencies) // 2] if latencies else 0
 
-        # Category scores
+        # Judge agreement (std dev) - only from complete judges
+        if len(cj_values) >= 2:
+            mean_ja = sum(cj_values) / len(cj_values)
+            judge_std_dev = round((sum((x - mean_ja) ** 2 for x in cj_values) / len(cj_values)) ** 0.5, 2)
+        else:
+            judge_std_dev = None
+
+        # Category scores: mean of complete judges only per category
         cat_scores = {}
         cat_deepeval = {}
         cat_composite = {}
+        cat_scorable = {cat: sum(1 for pid in cat_pids[cat] if runs_cache[pid] and not runs_cache[pid].get("error")) for cat in categories}
         for cat in categories:
-            cs = [
-                runs_cache[pid].get("judge_score_avg")
-                for pid in cat_pids[cat]
-                if runs_cache[pid] and runs_cache[pid].get("judge_score_avg") is not None
-            ]
-            cat_scores[cat] = round(sum(cs) / len(cs), 2) if cs else None
+            # Only include judges that scored every scorable prompt in this category
+            cat_ja_vals = []
+            for jname, jscores in judge_cat_breakdown[cat].items():
+                if jscores and len(jscores) >= cat_scorable[cat]:
+                    cat_ja_vals.append(sum(jscores) / len(jscores))
+            cat_scores[cat] = round(sum(cat_ja_vals) / len(cat_ja_vals), 2) if cat_ja_vals else None
             # DeepEval per-category average
             cat_de = [
                 runs_cache[pid].get("deepeval_avg")
@@ -126,17 +168,17 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             else:
                 cat_composite[cat] = None
 
-        # Difficulty scores (same pattern as cat_scores)
+        # Difficulty scores: mean of complete judges only per difficulty
         diff_scores = {}
         diff_deepeval = {}
         diff_composite = {}
+        diff_scorable = {d: sum(1 for pid in diff_pids[d] if runs_cache[pid] and not runs_cache[pid].get("error")) for d in difficulties}
         for d in difficulties:
-            ds = [
-                runs_cache[pid].get("judge_score_avg")
-                for pid in diff_pids[d]
-                if runs_cache[pid] and runs_cache[pid].get("judge_score_avg") is not None
-            ]
-            diff_scores[d] = round(sum(ds) / len(ds), 2) if ds else None
+            diff_ja_vals = []
+            for jname, jscores in judge_diff_breakdown[d].items():
+                if jscores and len(jscores) >= diff_scorable[d]:
+                    diff_ja_vals.append(sum(jscores) / len(jscores))
+            diff_scores[d] = round(sum(diff_ja_vals) / len(diff_ja_vals), 2) if diff_ja_vals else None
             d_de = [
                 runs_cache[pid].get("deepeval_avg")
                 for pid in diff_pids[d]
@@ -154,42 +196,32 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             else:
                 diff_composite[d] = None
 
-        # Judge agreement / divergence
+        # Judge vs DeepEval divergence (complete judges only)
+        # For each prompt, compute mean of complete judges' scores, normalize, compare to deepeval
         divergences = []
         for pid in pids:
             run = runs_cache[pid]
             if run and not run.get("error"):
-                js, da = run.get("judge_score_avg"), run.get("deepeval_avg")
-                if js is not None and da is not None:
-                    divergences.append(abs((js - 1) / 4 - da))
+                da = run.get("deepeval_avg")
+                if da is None:
+                    continue
+                cj_scores = []
+                for jname in complete_judges:
+                    jdata = run.get("judge_scores", {}).get(jname)
+                    if jdata and jdata.get("score") is not None:
+                        cj_scores.append(jdata["score"])
+                if cj_scores:
+                    js_mean = sum(cj_scores) / len(cj_scores)
+                    divergences.append(abs((js_mean - 1) / 4 - da))
         avg_divergence = round(sum(divergences) / len(divergences), 4) if divergences else None
 
-        # Per-judge score breakdown
-        judge_breakdown = {}
-        for pid in pids:
-            run = runs_cache[pid]
-            if not run or run.get("error"):
-                continue
-            for jname, jdata in run.get("judge_scores", {}).items():
-                if jname not in judge_breakdown:
-                    judge_breakdown[jname] = []
-                if jdata.get("score") is not None:
-                    judge_breakdown[jname].append(jdata["score"])
-        judge_averages = {}
-        for jname, jscores in judge_breakdown.items():
-            judge_averages[jname] = round(sum(jscores) / len(jscores), 2) if jscores else None
-        # Judge agreement (std dev)
-        ja_values = [v for v in judge_averages.values() if v is not None]
-        if len(ja_values) >= 2:
-            mean_ja = sum(ja_values) / len(ja_values)
-            judge_std_dev = round((sum((x - mean_ja) ** 2 for x in ja_values) / len(ja_values)) ** 0.5, 2)
-        else:
-            judge_std_dev = None
-
-        # Score distribution
+        # Score distribution from complete judges only (integer 1-5)
         dist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-        for s in scores:
-            dist[s] = dist.get(s, 0) + 1
+        for jname, jscores in judge_breakdown.items():
+            if jname in complete_judges:
+                for s in jscores:
+                    bucket = max(1, min(5, round(s)))
+                    dist[bucket] = dist.get(bucket, 0) + 1
 
         # Efficiency = score / log2(avg_tokens) - rewards high scores with fewer tokens
         if avg_s > 0 and avg_t > 1:
@@ -204,7 +236,7 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             deepeval_metrics[metric_key] = round(sum(vals) / len(vals), 4) if vals else None
 
         # Composite score: weighted average of normalized judge (0-1) and deepeval avg (0-1)
-        normalized_judge = (avg_s - 1) / 4 if scores else None
+        normalized_judge = (avg_s - 1) / 4 if cj_values else None
         if normalized_judge is not None and deepeval_avg is not None:
             composite_score = round(judge_weight * normalized_judge + deepeval_weight * deepeval_avg, 4)
         elif normalized_judge is not None:
@@ -233,7 +265,7 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
             "company": company,
             "launch_date": launch_date,
             "avg_score": round(avg_s, 2),
-            "scored": len(scores),
+            "scored": scored_count,
             "de_scored": de_scored,
             "total": total,
             "errors": errors,
@@ -309,6 +341,140 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
                 }
         prompt_results.append(pr)
 
+    # --- Per-judge global aggregations ---
+    # Collect all (judge, model, pid, score, deepeval_avg, category, difficulty) tuples
+    prompt_lookup = {p["id"]: p for p in prompts}
+    judge_all_scores = {}  # judge -> list of scores
+    judge_cat_scores = {}  # judge -> cat -> list of scores
+    judge_diff_scores = {}  # judge -> diff -> list of scores
+    judge_model_scores = {}  # judge -> model -> list of scores
+    judge_score_dists = {}  # judge -> {1:n, 2:n, ...}
+    judge_deepeval_divs = {}  # judge -> list of abs divergences
+    # For pairwise: prompt_key -> {judge: score}
+    prompt_judge_map = {}  # (model, pid) -> {judge: score}
+
+    for name, data in models.items():
+        for pid in pids:
+            run = latest_run(data, pid)
+            if not run or run.get("error"):
+                continue
+            p_info = prompt_lookup.get(pid, {})
+            cat = p_info.get("category", "")
+            diff = p_info.get("difficulty", "")
+            de_avg = run.get("deepeval_avg")
+
+            for jname, jdata in run.get("judge_scores", {}).items():
+                sc = jdata.get("score")
+                if sc is None:
+                    continue
+
+                # Global
+                judge_all_scores.setdefault(jname, []).append(sc)
+
+                # By category
+                judge_cat_scores.setdefault(jname, {}).setdefault(cat, []).append(sc)
+
+                # By difficulty
+                judge_diff_scores.setdefault(jname, {}).setdefault(diff, []).append(sc)
+
+                # By model
+                judge_model_scores.setdefault(jname, {}).setdefault(name, []).append(sc)
+
+                # Score distribution
+                if jname not in judge_score_dists:
+                    judge_score_dists[jname] = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                judge_score_dists[jname][sc] = judge_score_dists[jname].get(sc, 0) + 1
+
+                # DeepEval divergence per judge
+                if de_avg is not None:
+                    norm_sc = (sc - 1) / 4
+                    judge_deepeval_divs.setdefault(jname, []).append(abs(norm_sc - de_avg))
+
+                # Pairwise map
+                key = (name, pid)
+                prompt_judge_map.setdefault(key, {})[jname] = sc
+
+    # judge_global: each judge's global average
+    judge_global = {}
+    for jname, scores in judge_all_scores.items():
+        judge_global[jname] = round(sum(scores) / len(scores), 2)
+
+    # judge_by_category
+    judge_by_category = {}
+    for jname, cats_map in judge_cat_scores.items():
+        judge_by_category[jname] = {}
+        for cat, scores in cats_map.items():
+            judge_by_category[jname][cat] = round(sum(scores) / len(scores), 2)
+
+    # judge_by_difficulty
+    judge_by_difficulty = {}
+    for jname, diffs_map in judge_diff_scores.items():
+        judge_by_difficulty[jname] = {}
+        for d, scores in diffs_map.items():
+            judge_by_difficulty[jname][d] = round(sum(scores) / len(scores), 2)
+
+    # judge_by_model
+    judge_by_model = {}
+    for jname, models_map in judge_model_scores.items():
+        judge_by_model[jname] = {}
+        for mname, scores in models_map.items():
+            judge_by_model[jname][mname] = round(sum(scores) / len(scores), 2)
+
+    # judge_pairwise: pairwise agreement between judges (matrix form)
+    all_judges = sorted(judge_all_scores.keys())
+    judge_pairwise = {}
+    judge_pairwise_matrix = {}  # (ja, jb) -> {avg_diff, agree_pct, n}
+    for i, ja in enumerate(all_judges):
+        for jb in all_judges:
+            if ja == jb:
+                judge_pairwise_matrix[(ja, jb)] = {"avg_diff": 0, "agree_pct": 100, "n": 0, "self": True}
+                continue
+            diffs_list = []
+            agree_count = 0
+            for key, jscores in prompt_judge_map.items():
+                if ja in jscores and jb in jscores:
+                    diff_val = abs(jscores[ja] - jscores[jb])
+                    diffs_list.append(diff_val)
+                    if diff_val <= 1:
+                        agree_count += 1
+            if diffs_list:
+                judge_pairwise_matrix[(ja, jb)] = {
+                    "avg_diff": round(sum(diffs_list) / len(diffs_list), 2),
+                    "agree_pct": round(100 * agree_count / len(diffs_list)),
+                    "n": len(diffs_list),
+                    "self": False,
+                }
+                if ja < jb:
+                    pair_key = f"{ja} vs {jb}"
+                    judge_pairwise[pair_key] = judge_pairwise_matrix[(ja, jb)]
+
+    # judge_vs_deepeval
+    judge_vs_deepeval = {}
+    for jname, divs in judge_deepeval_divs.items():
+        judge_vs_deepeval[jname] = {
+            "avg_divergence": round(sum(divs) / len(divs), 4),
+        }
+
+    # Biggest disagreements: prompts where judges disagreed most
+    biggest_disagreements = []
+    for key, jscores in prompt_judge_map.items():
+        if len(jscores) < 2:
+            continue
+        vals = list(jscores.values())
+        spread = max(vals) - min(vals)
+        if spread > 0:
+            model_name, pid = key
+            p_info = prompt_lookup.get(pid, {})
+            biggest_disagreements.append({
+                "prompt_id": pid,
+                "model": model_name,
+                "category": p_info.get("category", ""),
+                "scores": jscores,
+                "spread": spread,
+            })
+    biggest_disagreements.sort(key=lambda x: x["spread"], reverse=True)
+    biggest_disagreements = biggest_disagreements[:30]
+
     return {
         "leaderboard": leaderboard,
         "categories": categories,
@@ -320,6 +486,15 @@ def compute_stats(models, prompts, judge_models=None, composite_config=None, mod
         "generated": datetime.now().isoformat(),
         "difficulties": difficulties,
         "prompt_results": prompt_results,
+        "judge_global": judge_global,
+        "judge_by_category": judge_by_category,
+        "judge_by_difficulty": judge_by_difficulty,
+        "judge_by_model": judge_by_model,
+        "judge_pairwise": judge_pairwise,
+        "judge_pairwise_matrix": {f"{ja}|{jb}": v for (ja, jb), v in judge_pairwise_matrix.items()},
+        "judge_score_distributions": judge_score_dists,
+        "judge_vs_deepeval": judge_vs_deepeval,
+        "biggest_disagreements": biggest_disagreements,
     }
 
 
@@ -345,6 +520,8 @@ def generate_html(stats):
     --accent: #6c72ff;
     --accent2: #4ecdc4;
     --green: #22c55e;
+    --green-mid: #4ade80;
+    --green-light: #86efac;
     --yellow: #eab308;
     --red: #ef4444;
     --orange: #f97316;
@@ -616,10 +793,19 @@ def generate_html(stats):
     font-variant-numeric: tabular-nums;
   }}
   .score-5 {{ color: var(--green); }}
-  .score-4 {{ color: #86efac; }}
+  .score-4 {{ color: var(--green-light); }}
   .score-3 {{ color: var(--yellow); }}
   .score-2 {{ color: var(--orange); }}
   .score-1 {{ color: var(--red); }}
+  .company-dot {{
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }}
   .tabs {{
     display: flex;
     gap: 0.25rem;
@@ -660,9 +846,34 @@ def generate_html(stats):
   }}
   .nav-link:hover {{ color: var(--text); background: rgba(255,255,255,0.05); }}
   .nav-link.active {{ color: var(--text); background: var(--accent); }}
+  .company-dot {{
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }}
   .table-scroll {{
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
+    position: relative;
+  }}
+  .table-scroll::after {{
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 30px;
+    pointer-events: none;
+    background: linear-gradient(to left, var(--surface), transparent);
+    opacity: 0;
+    transition: opacity 0.2s;
+  }}
+  .table-scroll.has-overflow::after {{
+    opacity: 1;
   }}
   th[data-sort] {{
     cursor: pointer;
@@ -745,7 +956,8 @@ def generate_html(stats):
         <a href="index.html" class="nav-link active">Overview</a>
         <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link">By Category</a>
-        <a href="prompts.html" class="nav-link">Prompts</a>
+        <a href="judges.html" class="nav-link">Judges</a>
+
         <a href="methodology.html" class="nav-link">Methodology</a>
       </nav>
     </div>
@@ -780,11 +992,14 @@ def generate_html(stats):
   </div>
 </div>
 
+<!-- Judge Leniency Strip -->
+{_judge_leniency_strip(stats)}
+
 <!-- Leaderboard + Score Chart -->
 <div class="grid-full">
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-      <h2 style="margin-bottom:0">Leaderboard <span class="info-tip" data-info="Ranked by composite score. Click column headers to re-sort.">?</span></h2>
+      <h2 style="margin-bottom:0">Leaderboard <span class="info-tip" data-info="Ranked by composite score. Click column headers to re-sort. Click a row to expand per-judge scores.">?</span></h2>
       <div style="display:flex;gap:0.5rem;align-items:center">
       <button class="col-toggle" id="col-toggle-btn" onclick="this.closest('.card').querySelector('.table-scroll').classList.toggle('show-all-cols');this.textContent=this.textContent==='Show all columns'?'Hide columns':'Show all columns'">Show all columns</button>
       <select id="company-filter" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:0.4rem 0.75rem;font-size:0.8rem;cursor:pointer">
@@ -848,7 +1063,7 @@ def generate_html(stats):
     </div>
   </div>
   <div class="card">
-    <h2>Judge vs DeepEval Divergence <span class="info-tip" data-info="Average absolute difference between normalised judge score (0-1) and DeepEval average per model. Lower means the two scoring methods agree more.">?</span></h2>
+    <h2>Judge vs DeepEval Divergence <span class="info-tip" data-info="Per prompt: mean of complete judges' normalised scores (0-1) vs DeepEval average. Averaged across all prompts. Lower means judge and automated scores agree more.">?</span></h2>
     <div class="chart-container">
       <canvas id="agreementChart"></canvas>
     </div>
@@ -927,6 +1142,16 @@ function compositeColor(s) {{
 Chart.defaults.color = '#8b90a5';
 Chart.defaults.borderColor = '#2e3345';
 Chart.defaults.font.family = "'Inter', sans-serif";
+
+// Scroll hint: detect overflow on .table-scroll containers
+document.querySelectorAll('.table-scroll').forEach(el => {{
+  function checkOverflow() {{
+    el.classList.toggle('has-overflow', el.scrollWidth > el.clientWidth && el.scrollLeft < el.scrollWidth - el.clientWidth - 5);
+  }}
+  checkOverflow();
+  el.addEventListener('scroll', checkOverflow);
+  window.addEventListener('resize', checkOverflow);
+}});
 
 // Composite score bar chart (0-1 scale)
 new Chart(document.getElementById('scoreChart'), {{
@@ -1290,6 +1515,35 @@ function setParams(obj) {{
 </html>"""
 
 
+COMPANY_COLORS = {
+    "OpenAI": "#10a37f",
+    "Anthropic": "#d4a574",
+    "Google": "#4285f4",
+    "Meta": "#0668e1",
+    "xAI": "#1d9bf0",
+    "Mistral": "#ff7000",
+    "Amazon": "#ff9900",
+    "Alibaba": "#ff6a00",
+    "Cohere": "#39594d",
+    "MiniMax": "#6c72ff",
+    "Moonshot": "#8b5cf6",
+    "Zhipu": "#00d4aa",
+}
+
+COMPANY_COLORS_DEFAULT = "#6c72ff"
+
+
+def _company_color(company):
+    """Return the brand color for a company, with fallback."""
+    return COMPANY_COLORS.get(company, COMPANY_COLORS_DEFAULT)
+
+
+def _company_colors_js():
+    """Return JS object literal for company colors."""
+    pairs = ", ".join(f"'{k}': '{v}'" for k, v in COMPANY_COLORS.items())
+    return f"const COMPANY_COLORS = {{{pairs}, '_default': '{COMPANY_COLORS_DEFAULT}'}};\nfunction companyColor(name) {{ return COMPANY_COLORS[name] || COMPANY_COLORS['_default']; }}"
+
+
 def _score_color(score):
     if score is None:
         return ""
@@ -1351,13 +1605,27 @@ def _efficiency_color(score):
     return "color:var(--orange)"
 
 
+def _judge_leniency_strip(stats):
+    """Generate horizontal strip showing each judge's global average."""
+    judge_global = stats.get("judge_global", {})
+    if not judge_global:
+        return ""
+    items = ""
+    sorted_judges = sorted(judge_global.keys(), key=lambda j: judge_global[j], reverse=True)
+    for jname in sorted_judges:
+        avg = judge_global[jname]
+        sc_color = _score_color(avg)
+        items += f'<span style="display:inline-flex;align-items:center;gap:0.4rem;padding:0.3rem 0.75rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.8rem"><span style="color:var(--text2)">{html_mod.escape(jname)}:</span> <strong class="{sc_color}">{avg:.2f}/5</strong></span>'
+    return f'<div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-bottom:1rem;align-items:center"><span style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text2);margin-right:0.25rem">Judge Averages</span>{items}</div>'
+
+
 def _nav_html(active_page, stats):
     """Generate the nav bar HTML with the active page highlighted."""
     pages = [
         ("index.html", "Overview"),
         ("companies.html", "Companies"),
         ("categories.html", "By Category"),
-        ("prompts.html", "Prompts"),
+        ("judges.html", "Judges"),
         ("methodology.html", "Methodology"),
     ]
     links = []
@@ -1467,6 +1735,7 @@ def _leaderboard_row(i, m):
     de_color = _deepeval_color(de_val)
 
     company = m.get('company', 'Unknown')
+    company_clr = _company_color(company)
 
     div_val = m.get("avg_divergence")
     div_str = f"{div_val:.3f}" if div_val is not None else "-"
@@ -1484,22 +1753,26 @@ def _leaderboard_row(i, m):
     judge_count = len(m.get("judge_averages", {}))
     agree_dot = f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{agree_color};margin-left:4px;vertical-align:middle" title="Judge std dev: {jsd}"></span>' if judge_count > 0 else ''
 
-    # Judge breakdown detail row
+    # Judge breakdown detail row with inline bar visualization
     ja = m.get("judge_averages", {})
-    detail_cells = ""
+    detail_bars = ""
     if ja:
-        detail_cells = "".join(
-            f'<td style="padding:0.25rem 0.5rem;font-size:0.75rem;color:var(--text2)">{jn}: <strong>{jv:.2f}</strong>/5</td>'
-            for jn, jv in ja.items() if jv is not None
-        )
-    detail_row = f'<tr class="judge-detail-row" data-parent="{m["name"]}" style="display:none;background:var(--surface2)"><td></td><td colspan="13" style="padding:0.4rem 0.75rem;font-size:0.75rem"><span style="color:var(--text2)">Per-judge averages:</span> <table style="display:inline-table;border:none;margin-left:0.5rem"><tr>{detail_cells}</tr></table></td></tr>' if detail_cells else ''
+        for jn, jv in ja.items():
+            if jv is None:
+                continue
+            bar_pct = (jv / 5) * 100
+            bar_color = "#22c55e" if jv >= 4.5 else "#86efac" if jv >= 3.5 else "#eab308" if jv >= 2.5 else "#f97316" if jv >= 1.5 else "#ef4444"
+            detail_bars += f'<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.25rem"><span style="min-width:120px;font-size:0.75rem;color:var(--text2)">{jn}</span><div style="flex:1;max-width:200px;height:6px;background:var(--border);border-radius:3px;overflow:hidden"><div style="width:{bar_pct:.0f}%;height:100%;background:{bar_color};border-radius:3px"></div></div><span style="font-size:0.75rem;font-weight:600;color:{bar_color};min-width:3rem">{jv:.2f}/5</span></div>'
+    # Chevron hint for expandable rows (shown next to judge score)
+    chevron = '<span style="font-size:0.55rem;color:var(--text2);margin-left:3px;vertical-align:middle;transition:transform 0.2s" title="Click to see per-judge scores">&#9660;</span>' if detail_bars else ''
+    detail_row = f'<tr class="judge-detail-row" data-parent="{m["name"]}" style="display:none;background:var(--surface2)"><td></td><td colspan="13" style="padding:0.6rem 0.75rem"><div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text2);margin-bottom:0.4rem">Per-Judge Scores</div>{detail_bars}</td></tr>' if detail_bars else ''
 
     return f"""<tr class="model-row" data-rank="{i+1}" data-name="{m['name']}" data-company="{company}" data-composite="{comp_data}" data-score="{m['avg_score']}" data-deepeval="{de_data}" data-scored="{m['scored']}" data-de_scored="{m['de_scored']}" data-errors="{m['errors']}" data-flags="{m['flagged']}" data-latency="{m['avg_latency']}" data-tokens="{m['avg_tokens']}" data-efficiency="{m['efficiency']}" data-divergence="{div_data}" style="cursor:pointer">
       <td><span class="rank {rank_cls}">{i+1}</span></td>
       <td style="font-weight:600">{m['name']}</td>
-      <td style="color:var(--text2);font-size:0.8rem">{company}</td>
+      <td style="color:var(--text2);font-size:0.8rem"><span class="company-dot" style="background:{company_clr}"></span>{company}</td>
       <td class="num" style="font-weight:700;{comp_color}">{comp_str}</td>
-      <td class="num {sc}" style="font-weight:600" title="{judge_count} judge(s)">{m['avg_score']:.2f}/5{agree_dot}</td>
+      <td class="num {sc}" style="font-weight:600;white-space:nowrap" title="{judge_count} judge(s)">{m['avg_score']:.2f}/5{chevron}</td>
       <td class="num" style="font-weight:600;{de_color}">{de_str}</td>
       <td class="num col-detail">{m['scored']}/{m['total']}</td>
       <td class="num col-detail">{m['de_scored']}/{m['total']}</td>
@@ -1557,15 +1830,18 @@ def generate_categories_html(stats):
     for cat in categories:
         best = None
         best_score = 0
+        best_company = "Unknown"
         for m in stats["leaderboard"]:
             s = m.get("cat_composite", {}).get(cat)
             if s is not None and s > best_score:
                 best_score = s
                 best = m["name"]
+                best_company = m.get("company", "Unknown")
         display_cat = cat.replace("_", " ").title()
+        winner_clr = _company_color(best_company)
         winner_cards += f"""<div class="winner-card">
           <div class="winner-cat">{display_cat}</div>
-          <div class="winner-name">{best or '-'}</div>
+          <div class="winner-name" style="color:{winner_clr}">{best or '-'}</div>
           <div class="winner-score">{best_score:.2f}</div>
         </div>\n"""
 
@@ -1597,6 +1873,8 @@ def generate_categories_html(stats):
     --text2: #8b90a5;
     --accent: #6c72ff;
     --green: #22c55e;
+    --green-mid: #4ade80;
+    --green-light: #86efac;
     --yellow: #eab308;
     --red: #ef4444;
     --orange: #f97316;
@@ -1754,7 +2032,8 @@ def generate_categories_html(stats):
         <a href="index.html" class="nav-link">Overview</a>
         <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link active">By Category</a>
-        <a href="prompts.html" class="nav-link">Prompts</a>
+        <a href="judges.html" class="nav-link">Judges</a>
+
         <a href="methodology.html" class="nav-link">Methodology</a>
       </nav>
     </div>
@@ -1877,7 +2156,8 @@ def generate_companies_html(stats):
               <td class="num" style="font-weight:600;{eff_color}">{m['efficiency']:.2f}</td>
             </tr>\n"""
 
-        company_sections += f"""<details class="company-section">
+        c_clr = _company_color(company)
+        company_sections += f"""<details class="company-section" style="border-left:3px solid {c_clr}">
       <summary class="company-toggle">{html_mod.escape(company)} <span class="company-count">({len(models)} model{"s" if len(models) != 1 else ""}) - best: {best_str}</span></summary>
       <div class="table-scroll">
         <table>
@@ -1917,6 +2197,8 @@ def generate_companies_html(stats):
     --accent: #6c72ff;
     --accent2: #4ecdc4;
     --green: #22c55e;
+    --green-mid: #4ade80;
+    --green-light: #86efac;
     --yellow: #eab308;
     --red: #ef4444;
     --orange: #f97316;
@@ -2137,7 +2419,7 @@ def generate_companies_html(stats):
     font-variant-numeric: tabular-nums;
   }}
   .score-5 {{ color: var(--green); }}
-  .score-4 {{ color: #86efac; }}
+  .score-4 {{ color: var(--green-light); }}
   .score-3 {{ color: var(--yellow); }}
   .score-2 {{ color: var(--orange); }}
   .score-1 {{ color: var(--red); }}
@@ -2167,7 +2449,8 @@ def generate_companies_html(stats):
         <a href="index.html" class="nav-link">Overview</a>
         <a href="companies.html" class="nav-link active">Companies</a>
         <a href="categories.html" class="nav-link">By Category</a>
-        <a href="prompts.html" class="nav-link">Prompts</a>
+        <a href="judges.html" class="nav-link">Judges</a>
+
         <a href="methodology.html" class="nav-link">Methodology</a>
       </nav>
     </div>
@@ -2230,6 +2513,8 @@ const COLORS = [
   '#f59e0b', '#14b8a6'
 ];
 
+{_company_colors_js()}
+
 function compositeColor(s) {{
   if (s >= 0.95) return '#22c55e';
   if (s >= 0.90) return '#4ade80';
@@ -2266,11 +2551,13 @@ lb.forEach(m => {{
     const avgComp = models.filter(m => m.composite_score != null).reduce((s, m) => s + m.composite_score, 0) / (models.filter(m => m.composite_score != null).length || 1);
     const bestScore = best.composite_score;
     const color = bestScore != null ? compositeColor(bestScore) : '#8b90a5';
+    const brandColor = companyColor(company);
     const card = document.createElement('div');
     card.className = 'company-card';
+    card.style.borderLeft = `3px solid ${{brandColor}}`;
     card.innerHTML = `
       <div class="company-name">${{company}}</div>
-      <div class="best-model" title="${{best.name}}">${{best.name}}</div>
+      <div class="best-model" title="${{best.name}}" style="color:${{brandColor}}">${{best.name}}</div>
       <div class="best-score" style="color:${{color}}">${{bestScore != null ? bestScore.toFixed(2) : '-'}}</div>
       <div class="model-count">${{models.length}} model${{models.length !== 1 ? 's' : ''}} &middot; avg ${{avgComp.toFixed(2)}}</div>
     `;
@@ -2293,8 +2580,8 @@ lb.forEach(m => {{
       labels: entries.map(e => e.company),
       datasets: [{{
         data: entries.map(e => e.score),
-        backgroundColor: entries.map(e => compositeColor(e.score) + 'cc'),
-        borderColor: entries.map(e => compositeColor(e.score)),
+        backgroundColor: entries.map(e => companyColor(e.company) + 'cc'),
+        borderColor: entries.map(e => companyColor(e.company)),
         borderWidth: 1,
         borderRadius: 4,
       }}]
@@ -2346,8 +2633,8 @@ lb.forEach(m => {{
     datasets.push({{
       label: company,
       data: data,
-      borderColor: COLORS[ci % COLORS.length],
-      backgroundColor: COLORS[ci % COLORS.length] + '33',
+      borderColor: companyColor(company),
+      backgroundColor: companyColor(company) + '33',
       borderWidth: 2,
       pointRadius: 4,
       pointHoverRadius: 6,
@@ -2440,7 +2727,8 @@ lb.forEach(m => {{
   // Build table
   let headerHtml = '<thead><tr><th>Company</th>';
   cats.forEach(cat => {{
-    headerHtml += '<th class="num" style="font-size:0.7rem">' + cat.replace(/_/g, ' ') + '</th>';
+    const catTitle = cat.replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+    headerHtml += '<th class="num" style="font-size:0.7rem">' + catTitle + '</th>';
   }});
   headerHtml += '</tr></thead>';
 
@@ -2452,7 +2740,7 @@ lb.forEach(m => {{
       if (s != null) {{
         const color = compositeColor(s);
         const bold = colWinners[cat] === company ? 'font-weight:800;' : 'font-weight:600;';
-        bodyHtml += '<td class="num" style="' + bold + 'color:' + color + ';background:' + color + '18;border-radius:4px">' + s.toFixed(2) + '</td>';
+        bodyHtml += '<td class="num" style="' + bold + 'color:' + color + ';background:' + color + '30;border-radius:4px">' + s.toFixed(2) + '</td>';
       }} else {{
         bodyHtml += '<td class="num" style="color:var(--text2)">-</td>';
       }}
@@ -2478,15 +2766,28 @@ def generate_methodology_html(stats):
     diffs = Counter(p["difficulty"] for p in prompts)
     checks = Counter(p["check_type"] for p in prompts)
 
+    category_descriptions = {
+        "coding": "Bug detection (including trap prompts with no bug), code generation, debugging, architecture design, security review, refactoring, concurrency, ML implementation, and cross-language tasks. Medium to hard difficulty.",
+        "learning": "Technical explanations, factual accuracy, nuanced comparisons, calibration, and trap questions testing common misconceptions. Tests depth of understanding vs surface-level answers.",
+        "reasoning": "Fermi estimation, logic puzzles, statistical analysis, ethical tradeoffs, causal reasoning, and false premise detection. Tests whether models show their work and catch tricks.",
+        "behavioural": "Sycophancy resistance, hallucination detection, appropriate refusal, verbosity control, and unsolicited opinion avoidance. Tests character and safety alignment.",
+        "writing": "Technical writing, tone switching, anti-slop detection, constrained writing, editing, email drafting, and argumentation. Tests natural voice and format compliance.",
+        "instruction_following": "Exact format compliance, multi-constraint tasks, conflicting instructions, creative constraints, and ambiguity handling. Tests literal instruction adherence.",
+        "research": "Source synthesis, contradictory evidence handling, technical evaluation, and summarization fidelity. Tests analytical depth over breadth.",
+        "meta": "Self-knowledge, calibration, honesty under pressure, and uncertainty expression. Tests whether models know what they don't know.",
+    }
+
     cat_rows = ""
     for cat in sorted(cats):
         display = cat.replace("_", " ").title()
         subcats = sorted(set(p["subcategory"].replace("_", " ") for p in prompts if p["category"] == cat))
         sub_str = ", ".join(subcats)
+        desc = category_descriptions.get(cat, "")
         cat_rows += f"""<tr>
           <td style="font-weight:600;text-transform:capitalize">{display}</td>
           <td class="num">{cats[cat]}</td>
           <td style="color:var(--text2);font-size:0.8rem">{sub_str}</td>
+          <td style="color:var(--text2);font-size:0.8rem">{desc}</td>
         </tr>\n"""
 
     diff_rows = ""
@@ -2542,8 +2843,6 @@ def generate_methodology_html(stats):
             <span class="prompt-diff" style="color:{diff_color}">{diff}</span>
             <span class="prompt-check">{check}</span>
           </div>
-          <div class="prompt-text">{prompt_text}</div>
-          <div class="prompt-ideal"><strong>What we look for:</strong> {ideal_text}</div>
           <div class="prompt-criteria">{criteria_html}</div>
         </div>\n"""
 
@@ -2569,6 +2868,8 @@ def generate_methodology_html(stats):
     --accent: #6c72ff;
     --accent2: #4ecdc4;
     --green: #22c55e;
+    --green-mid: #4ade80;
+    --green-light: #86efac;
     --yellow: #eab308;
     --red: #ef4444;
     --orange: #f97316;
@@ -2694,7 +2995,7 @@ def generate_methodology_html(stats):
   .scoring-scale .score {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
   .scoring-scale .desc {{ color: var(--text2); }}
   .score-5 {{ color: var(--green); }}
-  .score-4 {{ color: #86efac; }}
+  .score-4 {{ color: var(--green-light); }}
   .score-3 {{ color: var(--yellow); }}
   .score-2 {{ color: var(--orange); }}
   .score-1 {{ color: var(--red); }}
@@ -2918,7 +3219,8 @@ def generate_methodology_html(stats):
         <a href="index.html" class="nav-link">Overview</a>
         <a href="companies.html" class="nav-link">Companies</a>
         <a href="categories.html" class="nav-link">By Category</a>
-        <a href="prompts.html" class="nav-link">Prompts</a>
+        <a href="judges.html" class="nav-link">Judges</a>
+
         <a href="methodology.html" class="nav-link active">Methodology</a>
       </nav>
     </div>
@@ -2928,6 +3230,17 @@ def generate_methodology_html(stats):
 </div>
 
 <div class="container">
+
+<!-- Section Jump Nav -->
+<div style="position:sticky;top:0;z-index:10;background:var(--bg);padding:0.5rem 0;margin-bottom:1rem;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:0.4rem">
+  <a href="#section-focus" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Focus</a>
+  <a href="#section-pipeline" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Pipeline</a>
+  <a href="#section-scoring" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Scoring</a>
+  <a href="#section-deepeval" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">DeepEval</a>
+  <a href="#section-composite" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Composite</a>
+  <a href="#section-categories" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Categories</a>
+  <a href="#section-prompts" style="padding:0.3rem 0.7rem;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:0.75rem;color:var(--text2);text-decoration:none;transition:all 0.2s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text2)'">Prompts</a>
+</div>
 
 <!-- Quick stats -->
 <div class="kpi-row">
@@ -2950,7 +3263,7 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- Focus -->
-<div class="card">
+<div class="card" id="section-focus">
   <h2>Focus</h2>
   <p>
     This evaluation measures what matters for practical, day-to-day use of LLMs as a working tool.
@@ -2977,7 +3290,7 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- Pipeline -->
-<div class="card">
+<div class="card" id="section-pipeline">
   <h2>Evaluation Pipeline</h2>
   <p>Each model runs through the same pipeline for every prompt:</p>
   <div class="highlight">
@@ -3022,13 +3335,21 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- Judge scoring -->
-<div class="card">
-  <h2>LLM Judge Scoring</h2>
+<div class="card" id="section-scoring">
+  <h2>Multi-Judge Scoring</h2>
   <p>
-    A separate LLM (configured in <code>config.yaml</code>) scores every response on a 1-5 scale.
-    The judge receives the original prompt, the ideal answer, the scoring criteria, and any
+    Each model response is scored by multiple independent LLM judges (configured in <code>config.yaml</code>),
+    each scoring on a 1-5 scale. The current judges are <strong>gpt-4.1</strong> and <strong>claude-sonnet-4.6</strong>.
+    Each judge receives the original prompt, the ideal answer, the scoring criteria, and any
     auto-check flags. It returns a score and a short rationale.
   </p>
+  <h3>Averaging rules</h3>
+  <ul>
+    <li>A judge's scores only count toward the average if it has scored <strong>every scorable prompt</strong> for that model - partial coverage is excluded entirely</li>
+    <li>The displayed judge score is the mean of each qualifying judge's global average (equal weight per judge)</li>
+    <li>Self-judging is prevented - a judge model does not score its own responses (e.g. gpt-4.1 does not judge gpt-4.1)</li>
+    <li>Click any row on the leaderboard to see per-judge score breakdowns</li>
+  </ul>
   <div class="scoring-scale">
     <span class="score score-5">5</span><span class="desc">Excellent - fully addresses the prompt, accurate, well-structured, meets all criteria</span>
     <span class="score score-4">4</span><span class="desc">Good - mostly correct with minor gaps or style issues</span>
@@ -3046,10 +3367,10 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- DeepEval scoring -->
-<div class="card">
+<div class="card" id="section-deepeval">
   <h2>DeepEval G-Eval Scoring (Layer 3)</h2>
   <p>
-    In addition to the single LLM judge score, each response is scored by
+    In addition to the multi-judge scores, each response is scored by
     <a href="https://github.com/confident-ai/deepeval" style="color:var(--accent)">DeepEval</a>
     using G-Eval metrics - research-backed LLM evaluation criteria that provide
     multi-dimensional scoring on a 0-1 scale.
@@ -3070,13 +3391,14 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- Composite score -->
-<div class="card">
+<div class="card" id="section-composite">
   <h2>Composite Score</h2>
   <p>
-    The composite score merges the LLM Judge score and DeepEval average into a single
-    0-1 metric for unified ranking. The judge score is first normalized from its 1-5 scale
-    to 0-1 using <code>(judge_score - 1) / 4</code>, then combined with the DeepEval
-    average via a configurable weighted average.
+    The composite score merges the multi-judge average and DeepEval average into a single
+    0-1 metric for unified ranking. The judge score (mean of qualifying judges' averages)
+    is normalized from its 1-5 scale to 0-1 using <code>(judge_score - 1) / 4</code>,
+    then combined with the DeepEval average via a configurable weighted average.
+    Only judges with complete coverage (scored every prompt) contribute to the average.
   </p>
   <div class="highlight">
     composite = judge_weight &times; normalized_judge + deepeval_weight &times; deepeval_avg
@@ -3105,10 +3427,10 @@ def generate_methodology_html(stats):
 </div>
 
 <!-- Prompt breakdown -->
-<div class="card">
+<div class="card" id="section-categories">
   <h2>Prompt Set Breakdown</h2>
   <table>
-    <thead><tr><th>Category</th><th class="num">Prompts</th><th>Subcategories</th></tr></thead>
+    <thead><tr><th>Category</th><th class="num">Prompts</th><th>Subcategories</th><th>What It Tests</th></tr></thead>
     <tbody>{cat_rows}</tbody>
   </table>
 </div>
@@ -3121,8 +3443,17 @@ def generate_methodology_html(stats):
   </table>
 </div>
 
+<div class="card" style="border-left:3px solid var(--yellow);margin-top:2rem">
+  <h3 style="margin-top:0">Benchmark Integrity</h3>
+  <p style="margin:0;color:var(--text2)">
+    Exact prompts are not published to prevent models from being tuned to this specific benchmark.
+    Categories, evaluation criteria, and scoring methodology are fully documented above.
+    Each prompt is scored by automated checks where applicable, plus multi-judge LLM scoring for nuanced evaluation.
+  </p>
+</div>
+
 <!-- Questions -->
-<div class="section-divider">All {len(prompts)} Questions</div>
+<div class="section-divider" id="section-prompts">Prompt Categories and Criteria</div>
 
 <div class="filter-toolbar">
   <input type="text" id="search-input" placeholder="Search prompts...">
@@ -3193,26 +3524,142 @@ def generate_methodology_html(stats):
 </html>"""
 
 
-def generate_prompts_html(stats):
-    """Generate the prompt-level results page."""
-    # We only embed prompt_results (not full stats) to keep page size reasonable
-    prompts_data = stats.get("prompt_results", [])
-    categories = stats["categories"]
-    data_json = json.dumps({
-        "prompt_results": prompts_data,
-        "categories": categories,
-        "difficulties": stats.get("difficulties", ["easy", "medium", "hard"]),
-        "leaderboard": [{"name": m["name"]} for m in stats["leaderboard"]],
-    })
+def generate_judges_html(stats):
+    """Generate the judges analysis page."""
+    data_json = json.dumps(stats)
 
-    nav_html = _nav_html("prompts.html", stats)
+    judge_global = stats.get("judge_global", {})
+    judge_by_category = stats.get("judge_by_category", {})
+    judge_by_difficulty = stats.get("judge_by_difficulty", {})
+    judge_by_model = stats.get("judge_by_model", {})
+    judge_pairwise = stats.get("judge_pairwise", {})
+    judge_pairwise_matrix_raw = stats.get("judge_pairwise_matrix", {})
+    judge_pairwise_matrix = {tuple(k.split("|", 1)): v for k, v in judge_pairwise_matrix_raw.items()}
+    judge_score_dists = stats.get("judge_score_distributions", {})
+    judge_vs_deepeval = stats.get("judge_vs_deepeval", {})
+    biggest_disagreements = stats.get("biggest_disagreements", [])
+    all_judges = sorted(judge_global.keys())
+
+    # No judges at all - show a placeholder
+    if not all_judges:
+        return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>BenchPress - Judges</title>
+<style>body{{font-family:sans-serif;background:#0f1117;color:#e4e7f0;padding:3rem;text-align:center}}
+a{{color:#6c72ff}}</style></head>
+<body><h1>No judge data available yet</h1><p>Run evaluations with multiple judges to see analysis here.</p>
+<p><a href="index.html">Back to overview</a></p></body></html>"""
+
+    # KPI cards
+    judge_total_scored = {}
+    for jname, dist in judge_score_dists.items():
+        judge_total_scored[jname] = sum(dist.values())
+
+    # Find strictest / most lenient
+    sorted_judges = sorted(all_judges, key=lambda j: judge_global.get(j, 0))
+    strictest = sorted_judges[0] if sorted_judges else "-"
+    most_lenient = sorted_judges[-1] if sorted_judges else "-"
+
+    max_scored = max(judge_total_scored.values()) if judge_total_scored else 0
+
+    kpi_cards = ""
+    for jname in all_judges:
+        avg = judge_global.get(jname, 0)
+        total = judge_total_scored.get(jname, 0)
+        badge = ""
+        if jname == strictest and len(all_judges) > 1:
+            badge = '<span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:600;background:rgba(239,68,68,0.15);color:#ef4444;margin-left:0.5rem">Strictest</span>'
+        elif jname == most_lenient and len(all_judges) > 1:
+            badge = '<span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:600;background:rgba(34,197,94,0.15);color:#22c55e;margin-left:0.5rem">Most Lenient</span>'
+        progress_badge = ""
+        if max_scored > 0 and total < max_scored * 0.8:
+            pct = round(100 * total / max_scored)
+            progress_badge = f' <span style="display:inline-block;padding:0.15rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:600;background:rgba(234,179,8,0.15);color:#eab308;margin-left:0.25rem">{pct}% complete</span>'
+        kpi_cards += f"""<div class="kpi">
+          <div class="label">{html_mod.escape(jname)}{badge}</div>
+          <div class="value">{avg:.2f}<span style="font-size:0.9rem;color:var(--text2)">/5</span></div>
+          <div class="sub">{total} prompts scored{progress_badge}</div>
+        </div>\n"""
+
+    # Pairwise agreement heatmap
+    def _agree_heatmap_color(pct):
+        if pct >= 90: return "rgba(34,197,94,0.25)"
+        if pct >= 80: return "rgba(134,239,172,0.2)"
+        if pct >= 70: return "rgba(234,179,8,0.2)"
+        if pct >= 60: return "rgba(249,115,22,0.2)"
+        return "rgba(239,68,68,0.2)"
+
+    def _agree_text_color(pct):
+        if pct >= 80: return "#22c55e"
+        if pct >= 60: return "#eab308"
+        return "#ef4444"
+
+    heatmap_html = ""
+    if len(all_judges) >= 2:
+        # Build header row
+        hdr_cells = '<th style="min-width:100px"></th>'
+        for j in all_judges:
+            hdr_cells += f'<th style="text-align:center;font-size:0.75rem;padding:0.5rem;color:var(--text2)">{html_mod.escape(j)}</th>'
+        # Build body rows
+        body_rows = ""
+        for ja in all_judges:
+            cells = f'<td style="font-weight:600;font-size:0.75rem;white-space:nowrap;padding:0.5rem 0.75rem">{html_mod.escape(ja)}</td>'
+            for jb in all_judges:
+                pdata = judge_pairwise_matrix.get((ja, jb))
+                if pdata and pdata["self"]:
+                    cells += '<td style="text-align:center;padding:0.5rem;background:var(--surface);color:var(--text2);font-size:0.7rem">-</td>'
+                elif pdata:
+                    bg = _agree_heatmap_color(pdata["agree_pct"])
+                    tc = _agree_text_color(pdata["agree_pct"])
+                    cells += f'<td style="text-align:center;padding:0.5rem;background:{bg}" title="Avg diff: {pdata["avg_diff"]:.2f} | {pdata["n"]} prompts compared"><div style="font-size:0.95rem;font-weight:700;color:{tc}">{pdata["agree_pct"]}%</div><div style="font-size:0.65rem;color:var(--text2);margin-top:2px">diff {pdata["avg_diff"]:.2f}</div></td>'
+                else:
+                    cells += '<td style="text-align:center;padding:0.5rem;color:var(--text2);font-size:0.7rem">n/a</td>'
+            body_rows += f"<tr>{cells}</tr>\n"
+        heatmap_html = f"""<table style="border-collapse:collapse;width:auto">
+          <thead><tr>{hdr_cells}</tr></thead>
+          <tbody>{body_rows}</tbody>
+        </table>"""
+
+    # Judge vs DeepEval rows
+    jvd_rows = ""
+    for jname in all_judges:
+        jvd = judge_vs_deepeval.get(jname, {})
+        div_val = jvd.get("avg_divergence")
+        if div_val is not None:
+            div_color = "#22c55e" if div_val <= 0.10 else "#eab308" if div_val <= 0.20 else "#ef4444"
+            jvd_rows += f"""<tr>
+              <td style="font-weight:600">{html_mod.escape(jname)}</td>
+              <td class="num" style="font-weight:600;color:{div_color}">{div_val:.4f}</td>
+            </tr>\n"""
+
+    # Biggest disagreements table rows
+    disagree_rows = ""
+    for d in biggest_disagreements[:20]:
+        score_cells = ""
+        for jname in all_judges:
+            sc = d["scores"].get(jname)
+            if sc is not None:
+                sc_color = _score_color(sc)
+                score_cells += f'<td class="num {sc_color}" style="font-weight:600">{sc}/5</td>'
+            else:
+                score_cells += '<td class="num" style="color:var(--text2)">-</td>'
+        spread_color = "#ef4444" if d["spread"] >= 3 else "#eab308" if d["spread"] >= 2 else "#f97316"
+        disagree_rows += f"""<tr>
+          <td style="font-weight:600;color:var(--accent)">{html_mod.escape(d['prompt_id'])}</td>
+          <td>{html_mod.escape(d['model'])}</td>
+          <td>{html_mod.escape(d['category'])}</td>
+          {score_cells}
+          <td class="num" style="font-weight:700;color:{spread_color}">{d['spread']}</td>
+        </tr>\n"""
+
+    judge_score_headers = "".join(f'<th class="num">{html_mod.escape(j)}</th>' for j in all_judges)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BenchPress - Prompt Results</title>
+<title>BenchPress - Judge Analysis</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   :root {{
     --bg: #0f1117;
@@ -3224,6 +3671,8 @@ def generate_prompts_html(stats):
     --accent: #6c72ff;
     --accent2: #4ecdc4;
     --green: #22c55e;
+    --green-mid: #4ade80;
+    --green-light: #86efac;
     --yellow: #eab308;
     --red: #ef4444;
     --orange: #f97316;
@@ -3276,110 +3725,116 @@ def generate_prompts_html(stats):
     margin: 0 auto;
     padding: 1.5rem 2.5rem 3rem;
   }}
-  .filter-toolbar {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    align-items: center;
+  .kpi-row {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
     margin-bottom: 1.5rem;
-    padding: 1rem;
+  }}
+  .kpi {{
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 10px;
+    padding: 1.25rem;
   }}
-  .filter-toolbar input[type="text"] {{
-    flex: 1;
-    min-width: 200px;
-    padding: 0.5rem 0.75rem;
-    background: var(--surface2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 0.85rem;
-    outline: none;
-  }}
-  .filter-toolbar input[type="text"]:focus {{
-    border-color: var(--accent);
-  }}
-  .filter-toolbar select {{
-    padding: 0.5rem 0.75rem;
-    background: var(--surface2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    font-size: 0.8rem;
-    cursor: pointer;
-  }}
-  .filter-toolbar .filter-count {{
-    font-size: 0.8rem;
-    color: var(--text2);
-    margin-left: auto;
-  }}
-  .prompt-section {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    margin-bottom: 0.75rem;
-    overflow: hidden;
-  }}
-  .prompt-toggle {{
-    padding: 0.75rem 1.25rem;
-    cursor: pointer;
-    list-style: none;
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    flex-wrap: wrap;
-  }}
-  .prompt-toggle::-webkit-details-marker {{ display: none; }}
-  .prompt-toggle::before {{
-    content: '\\25B6';
-    font-size: 0.6rem;
-    color: var(--text2);
-    transition: transform 0.2s;
-  }}
-  details.prompt-section[open] .prompt-toggle::before {{
-    transform: rotate(90deg);
-  }}
-  .prompt-toggle .pid {{
-    font-weight: 700;
-    font-size: 0.8rem;
-    color: var(--accent);
-    background: rgba(108,114,255,0.1);
-    padding: 0.1rem 0.5rem;
-    border-radius: 4px;
-    font-family: monospace;
-  }}
-  .prompt-toggle .pcat {{
+  .kpi .label {{
     font-size: 0.75rem;
     color: var(--text2);
-    text-transform: capitalize;
-  }}
-  .prompt-toggle .pdiff {{
-    font-size: 0.7rem;
-    font-weight: 600;
     text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
   }}
-  .prompt-toggle .ptext {{
+  .kpi .value {{
+    font-size: 1.8rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }}
+  .kpi .sub {{
     font-size: 0.8rem;
     color: var(--text2);
+    margin-top: 0.25rem;
+  }}
+  .grid-2 {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+    align-items: stretch;
+  }}
+  .grid-full {{
+    margin-bottom: 1.5rem;
+  }}
+  .card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+  }}
+  .card h2 {{
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    color: var(--text);
+  }}
+  .card .chart-container {{
     flex: 1;
+  }}
+  .chart-container {{
+    position: relative;
+    width: 100%;
+    min-height: 320px;
+    height: 320px;
+  }}
+  .chart-container-wide {{
+    position: relative;
+    width: 100%;
+    min-height: 400px;
+    height: 400px;
+  }}
+  .info-tip {{
+    display: inline-block;
+    position: relative;
+    width: 16px;
+    height: 16px;
+    line-height: 16px;
+    text-align: center;
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--text2);
+    background: var(--surface2);
+    border-radius: 50%;
+    margin-left: 6px;
+    cursor: default;
+    vertical-align: middle;
+  }}
+  .info-tip:hover::after {{
+    content: attr(data-info);
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    margin-top: 6px;
+    background: var(--surface2);
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 400;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 200px;
+    z-index: 20;
+    pointer-events: none;
+    border: 1px solid var(--border);
   }}
-  .prompt-body {{
-    padding: 0 1.25rem 1rem;
-  }}
-  .prompt-body table {{
+  table {{
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
   }}
-  .prompt-body th {{
+  th {{
     text-align: left;
-    padding: 0.5rem 0.75rem;
+    padding: 0.6rem 0.75rem;
     border-bottom: 2px solid var(--border);
     color: var(--text2);
     font-weight: 600;
@@ -3388,24 +3843,42 @@ def generate_prompts_html(stats):
     letter-spacing: 0.04em;
     white-space: nowrap;
   }}
-  .prompt-body th.num {{ text-align: right; }}
-  .prompt-body td {{
-    padding: 0.5rem 0.75rem;
+  th.num {{ text-align: right; }}
+  td {{
+    padding: 0.6rem 0.75rem;
     border-bottom: 1px solid var(--border);
     font-variant-numeric: tabular-nums;
   }}
-  .prompt-body td.num {{ text-align: right; }}
-  .prompt-body tr:last-child td {{ border-bottom: none; }}
-  .prompt-body tr:hover td {{ background: var(--surface2); }}
-  @media (max-width: 900px) {{
-    .header {{ padding: 1rem; }}
-    .header-top {{ flex-direction: column; align-items: flex-start; gap: 0.5rem; }}
-    .container {{ padding: 1rem; }}
+  td.num {{ text-align: right; }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr:hover td {{ background: var(--surface2); }}
+  .table-scroll {{
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }}
+  .score-5 {{ color: var(--green); }}
+  .score-4 {{ color: var(--green-light); }}
+  .score-3 {{ color: var(--yellow); }}
+  .score-2 {{ color: var(--orange); }}
+  .score-1 {{ color: var(--red); }}
+  .section-title {{
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text2);
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }}
+  @media (max-width: 1100px) {{
+    .grid-2 {{ grid-template-columns: 1fr; }}
   }}
   @media (max-width: 600px) {{
+    .kpi-row {{ grid-template-columns: 1fr 1fr; gap: 0.75rem; }}
     .container {{ padding: 0.75rem; }}
     .header {{ padding: 1rem 0.75rem; }}
-    .header h1 {{ font-size: 1.2rem; }}
+    .chart-container {{ height: 260px; min-height: 260px; }}
+    .chart-container-wide {{ height: 300px; min-height: 300px; }}
   }}
 </style>
 </head>
@@ -3414,168 +3887,296 @@ def generate_prompts_html(stats):
 <div class="header">
   <div class="header-inner">
     <div class="header-top">
-      <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- LLM Evaluation Leaderboard</span></h1>
-      {nav_html}
+      <h1>BenchPress <span style="font-weight:400;color:var(--text2)">- Judge Analysis</span></h1>
+      {_nav_html("judges.html", stats)}
     </div>
-    <p class="byline">Opinionated in scope. Objective in execution.</p>
-    <div class="meta">{stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; {len(stats['categories'])} categories{f' &middot; Judges: {", ".join(stats["judge_models"])}' if stats.get("judge_models") else ''} &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
+    <p class="byline">How do different judges score models?</p>
+    <div class="meta">{len(all_judges)} judge(s) &middot; {stats['total_models']} models &middot; {stats['total_prompts']} prompts &middot; Updated {datetime.fromisoformat(stats['generated']).strftime('%b %d, %Y %H:%M')}</div>
   </div>
 </div>
 
 <div class="container">
 
-<div class="filter-toolbar">
-  <input type="text" id="search-input" placeholder="Search prompts...">
-  <select id="filter-category">
-    <option value="">All Categories</option>
-  </select>
-  <select id="filter-difficulty">
-    <option value="">All Difficulties</option>
-    <option value="easy">Easy</option>
-    <option value="medium">Medium</option>
-    <option value="hard">Hard</option>
-  </select>
-  <span class="filter-count" id="filter-count"></span>
+<!-- Judge KPI Strip -->
+<div class="kpi-row">
+  {kpi_cards}
 </div>
 
-<div id="prompts-container"></div>
+<!-- Score Distributions -->
+<div class="grid-full">
+  <div class="card">
+    <h2>Judge Score Distributions <span class="info-tip" data-info="How each judge distributes scores 1-5. Reveals if a judge skews harsh (more 1-2) or lenient (more 4-5).">?</span></h2>
+    <div class="chart-container-wide">
+      <canvas id="judgeDistChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Comparison by Model + by Category -->
+<div class="grid-2">
+  <div class="card">
+    <h2>By Model (Top 15) <span class="info-tip" data-info="Each judge's average score per model. Shows where judges agree and disagree.">?</span></h2>
+    <div class="chart-container-wide">
+      <canvas id="judgeByModelChart"></canvas>
+    </div>
+  </div>
+  <div class="card">
+    <h2>By Category <span class="info-tip" data-info="Each judge's average score per category. Shows if a judge is harder on certain task types.">?</span></h2>
+    <div class="chart-container-wide">
+      <canvas id="judgeByCategoryChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Comparison by Difficulty -->
+<div class="grid-2">
+  <div class="card">
+    <h2>By Difficulty <span class="info-tip" data-info="Each judge's average score for easy, medium, and hard prompts.">?</span></h2>
+    <div class="chart-container">
+      <canvas id="judgeByDifficultyChart"></canvas>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Judge vs DeepEval Divergence <span class="info-tip" data-info="Per judge: average absolute difference between the judge's normalised score (0-1) and DeepEval average across all prompts. Lower means more aligned with automated evaluation.">?</span></h2>
+    <div class="chart-container">
+      <canvas id="judgeVsDeepEvalChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- Pairwise Agreement Heatmap -->
+{"" if not heatmap_html else f'''<div class="grid-full">
+  <div class="card">
+    <h2>Judge Agreement <span class="info-tip" data-info="Pairwise agreement between judges. Each cell shows the percentage of prompts where both judges scored within 1 point of each other, plus the average score difference. Hover for details.">?</span></h2>
+    <div class="table-scroll">
+      {heatmap_html}
+    </div>
+  </div>
+</div>'''}
+
+<!-- Biggest Disagreements -->
+{"" if not disagree_rows else f'''<div class="grid-full">
+  <div class="card">
+    <h2>Biggest Disagreements <span class="info-tip" data-info="Prompts where judges disagreed the most, sorted by score spread.">?</span></h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Prompt</th>
+            <th>Model</th>
+            <th>Category</th>
+            {judge_score_headers}
+            <th class="num">Spread</th>
+          </tr>
+        </thead>
+        <tbody>
+          {disagree_rows}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>'''}
 
 </div>
 
 <script>
 const DATA = {data_json};
-const prompts = DATA.prompt_results;
-const diffColors = {{ easy: '#22c55e', medium: '#eab308', hard: '#ef4444' }};
+const COLORS = [
+  '#6c72ff', '#4ecdc4', '#f97316', '#22c55e', '#ec4899',
+  '#eab308', '#8b5cf6', '#06b6d4', '#ef4444', '#84cc16'
+];
+Chart.defaults.color = '#8b90a5';
+Chart.defaults.borderColor = '#2e3345';
+Chart.defaults.font.family = "'Inter', sans-serif";
 
-function scoreColor(s) {{
-  if (s == null) return 'color:var(--text2)';
-  if (s >= 0.8) return 'color:#22c55e';
-  if (s >= 0.6) return 'color:#86efac';
-  if (s >= 0.4) return 'color:#eab308';
-  if (s >= 0.2) return 'color:#f97316';
-  return 'color:#ef4444';
-}}
+const judges = Object.keys(DATA.judge_global || {{}}).sort();
 
-function judgeColor(s) {{
-  if (s == null) return 'color:var(--text2)';
-  if (s >= 4.5) return 'color:#22c55e';
-  if (s >= 3.5) return 'color:#86efac';
-  if (s >= 2.5) return 'color:#eab308';
-  if (s >= 1.5) return 'color:#f97316';
-  return 'color:#ef4444';
-}}
-
-// Populate category dropdown
-const catSel = document.getElementById('filter-category');
-DATA.categories.forEach(c => {{
-  const opt = document.createElement('option');
-  opt.value = c;
-  opt.textContent = c.replace(/_/g, ' ');
-  opt.style.textTransform = 'capitalize';
-  catSel.appendChild(opt);
-}});
-
-// Render prompts
-const container = document.getElementById('prompts-container');
-
-prompts.forEach(p => {{
-  const section = document.createElement('details');
-  section.className = 'prompt-section';
-  section.dataset.category = p.category;
-  section.dataset.difficulty = p.difficulty;
-
-  const diffColor = diffColors[p.difficulty] || 'var(--text2)';
-
-  // Build model comparison table rows sorted by composite-like score
-  const modelEntries = Object.entries(p.models || {{}});
-  modelEntries.sort((a, b) => {{
-    const sa = (a[1].judge_score != null && a[1].deepeval_avg != null)
-      ? 0.5 * (a[1].judge_score - 1) / 4 + 0.5 * a[1].deepeval_avg
-      : (a[1].judge_score != null ? (a[1].judge_score - 1) / 4 : (a[1].deepeval_avg || 0));
-    const sb = (b[1].judge_score != null && b[1].deepeval_avg != null)
-      ? 0.5 * (b[1].judge_score - 1) / 4 + 0.5 * b[1].deepeval_avg
-      : (b[1].judge_score != null ? (b[1].judge_score - 1) / 4 : (b[1].deepeval_avg || 0));
-    return sb - sa;
-  }});
-
-  let rows = '';
-  modelEntries.forEach(([name, d]) => {{
-    if (d.error) {{
-      rows += '<tr><td style="font-weight:600">' + name + '</td><td class="num" style="color:var(--red)">Error</td><td class="num">-</td><td class="num">-</td><td class="num">-</td></tr>';
-      return;
+// Score distribution grouped bar chart
+(function() {{
+  const canvas = document.getElementById('judgeDistChart');
+  if (!canvas || !judges.length) return;
+  const scores = [1, 2, 3, 4, 5];
+  const scoreColors = ['#ef4444', '#f97316', '#eab308', '#86efac', '#22c55e'];
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: scores.map(s => s + '/5'),
+      datasets: judges.map((j, i) => ({{
+        label: j,
+        data: scores.map(s => (DATA.judge_score_distributions[j] || {{}})[s] || 0),
+        backgroundColor: COLORS[i % COLORS.length] + 'cc',
+        borderColor: COLORS[i % COLORS.length],
+        borderWidth: 1,
+        borderRadius: 4,
+      }}))
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }}
+      }},
+      scales: {{
+        x: {{ ticks: {{ font: {{ size: 12 }} }} }},
+        y: {{ beginAtZero: true, title: {{ display: true, text: 'Count', color: '#8b90a5' }} }}
+      }}
     }}
-    const js = d.judge_score;
-    const da = d.deepeval_avg;
-    const jsStr = js != null ? js + '/5' : '-';
-    const daStr = da != null ? da.toFixed(2) : '-';
-    const flags = d.flags && d.flags.length ? '<span style="color:var(--yellow)">' + d.flags.join(', ') + '</span>' : '-';
-    // Per-judge score breakdown
-    let judgeDetail = '';
-    const jScores = d.judge_scores || {{}};
-    const judgeNames = Object.keys(jScores);
-    if (judgeNames.length > 0) {{
-      judgeDetail = '<div style="font-size:0.7rem;color:var(--text2);margin-top:2px">';
-      judgeNames.forEach((jn, idx) => {{
-        const jd = jScores[jn];
-        const sc = jd && jd.score != null ? jd.score + '/5' : '-';
-        judgeDetail += (idx > 0 ? ' &middot; ' : '') + jn + ': ' + sc;
-      }});
-      judgeDetail += '</div>';
+  }});
+}})();
+
+// By Model grouped bar chart (top 15)
+(function() {{
+  const canvas = document.getElementById('judgeByModelChart');
+  if (!canvas || !judges.length) return;
+  const jbm = DATA.judge_by_model || {{}};
+  // Get all models from the first judge, sorted by leaderboard order
+  const lbNames = DATA.leaderboard.map(m => m.name);
+  const modelNames = lbNames.slice(0, 15);
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: modelNames,
+      datasets: judges.map((j, i) => ({{
+        label: j,
+        data: modelNames.map(m => (jbm[j] || {{}})[m] || 0),
+        backgroundColor: COLORS[i % COLORS.length] + 'cc',
+        borderColor: COLORS[i % COLORS.length],
+        borderWidth: 1,
+        borderRadius: 3,
+      }}))
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }}
+      }},
+      scales: {{
+        y: {{ min: 1, max: 5, ticks: {{ stepSize: 1 }} }},
+        x: {{ ticks: {{ maxRotation: 45, font: {{ size: 10 }} }} }}
+      }}
     }}
-    const judgeCountTip = d.judge_count ? d.judge_count + ' judge(s)' : '';
-    rows += '<tr><td style="font-weight:600">' + name + '</td>' +
-      '<td class="num" style="font-weight:600;' + judgeColor(js) + '" title="' + judgeCountTip + '">' + jsStr + judgeDetail + '</td>' +
-      '<td class="num" style="font-weight:600;' + scoreColor(da) + '">' + daStr + '</td>' +
-      '<td class="num">' + d.latency_s + 's</td>' +
-      '<td class="num">' + flags + '</td></tr>';
   }});
+}})();
 
-  const truncText = p.prompt_text.length > 120 ? p.prompt_text.substring(0, 120) + '...' : p.prompt_text;
-
-  section.innerHTML = `
-    <summary class="prompt-toggle">
-      <span class="pid">${{p.id}}</span>
-      <span class="pcat">${{p.category.replace(/_/g, ' ')}}</span>
-      <span class="pdiff" style="color:${{diffColor}}">${{p.difficulty}}</span>
-      <span class="ptext">${{truncText}}</span>
-    </summary>
-    <div class="prompt-body">
-      <table>
-        <thead><tr><th>Model</th><th class="num">Judge</th><th class="num">DeepEval</th><th class="num">Latency</th><th class="num">Flags</th></tr></thead>
-        <tbody>${{rows}}</tbody>
-      </table>
-    </div>
-  `;
-
-  container.appendChild(section);
-}});
-
-// Filters
-const searchInput = document.getElementById('search-input');
-const diffFilter = document.getElementById('filter-difficulty');
-const countDisplay = document.getElementById('filter-count');
-const total = prompts.length;
-countDisplay.textContent = total + ' of ' + total + ' shown';
-
-function applyFilters() {{
-  const query = searchInput.value.toLowerCase();
-  const cat = catSel.value;
-  const diff = diffFilter.value;
-  let shown = 0;
-  document.querySelectorAll('.prompt-section').forEach(s => {{
-    const matchCat = !cat || s.dataset.category === cat;
-    const matchDiff = !diff || s.dataset.difficulty === diff;
-    const matchText = !query || s.textContent.toLowerCase().includes(query);
-    const visible = matchCat && matchDiff && matchText;
-    s.style.display = visible ? '' : 'none';
-    if (visible) shown++;
+// By Category grouped bar chart
+(function() {{
+  const canvas = document.getElementById('judgeByCategoryChart');
+  if (!canvas || !judges.length) return;
+  const jbc = DATA.judge_by_category || {{}};
+  const cats = DATA.categories || [];
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: cats.map(c => c.replace('_', ' ')),
+      datasets: judges.map((j, i) => ({{
+        label: j,
+        data: cats.map(c => (jbc[j] || {{}})[c] || 0),
+        backgroundColor: COLORS[i % COLORS.length] + 'cc',
+        borderColor: COLORS[i % COLORS.length],
+        borderWidth: 1,
+        borderRadius: 4,
+      }}))
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }}
+      }},
+      scales: {{
+        y: {{ min: 1, max: 5, ticks: {{ stepSize: 1 }} }},
+        x: {{ ticks: {{ maxRotation: 45, font: {{ size: 11 }} }} }}
+      }}
+    }}
   }});
-  countDisplay.textContent = shown + ' of ' + total + ' shown';
-}}
+}})();
 
-searchInput.addEventListener('input', applyFilters);
-catSel.addEventListener('change', applyFilters);
-diffFilter.addEventListener('change', applyFilters);
+// By Difficulty grouped bar chart
+(function() {{
+  const canvas = document.getElementById('judgeByDifficultyChart');
+  if (!canvas || !judges.length) return;
+  const jbd = DATA.judge_by_difficulty || {{}};
+  const diffs = ['easy', 'medium', 'hard'];
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: diffs.map(d => d.charAt(0).toUpperCase() + d.slice(1)),
+      datasets: judges.map((j, i) => ({{
+        label: j,
+        data: diffs.map(d => (jbd[j] || {{}})[d] || 0),
+        backgroundColor: COLORS[i % COLORS.length] + 'cc',
+        borderColor: COLORS[i % COLORS.length],
+        borderWidth: 1,
+        borderRadius: 4,
+      }}))
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{
+          position: 'bottom',
+          labels: {{ boxWidth: 12, padding: 12, font: {{ size: 11 }} }}
+        }}
+      }},
+      scales: {{
+        y: {{ min: 1, max: 5, ticks: {{ stepSize: 1 }} }},
+        x: {{ ticks: {{ font: {{ size: 12 }} }} }}
+      }}
+    }}
+  }});
+}})();
+
+// Judge vs DeepEval divergence
+(function() {{
+  const canvas = document.getElementById('judgeVsDeepEvalChart');
+  if (!canvas || !judges.length) return;
+  const jvd = DATA.judge_vs_deepeval || {{}};
+  const divData = judges.map(j => ({{
+    name: j,
+    div: (jvd[j] || {{}}).avg_divergence || 0
+  }})).sort((a, b) => a.div - b.div);
+
+  function divColor(d) {{
+    if (d <= 0.10) return '#22c55e';
+    if (d <= 0.15) return '#86efac';
+    if (d <= 0.20) return '#eab308';
+    return '#ef4444';
+  }}
+
+  new Chart(canvas, {{
+    type: 'bar',
+    data: {{
+      labels: divData.map(d => d.name),
+      datasets: [{{
+        data: divData.map(d => d.div),
+        backgroundColor: divData.map(d => divColor(d.div) + 'cc'),
+        borderColor: divData.map(d => divColor(d.div)),
+        borderWidth: 1,
+        borderRadius: 4,
+      }}]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{ legend: {{ display: false }} }},
+      scales: {{
+        y: {{ beginAtZero: true, title: {{ display: true, text: 'Avg Divergence', color: '#8b90a5' }} }},
+        x: {{ ticks: {{ font: {{ size: 11 }} }} }}
+      }}
+    }}
+  }});
+}})();
 </script>
 
 </body>
@@ -3633,11 +4234,12 @@ def generate_dashboard(output_path=None):
     with open(meth_path, "w") as f:
         f.write(meth_html)
 
-    # Prompts page
-    prompts_path = os.path.join(out_dir or ".", "prompts.html")
-    prompts_html = generate_prompts_html(stats)
-    with open(prompts_path, "w") as f:
-        f.write(prompts_html)
+
+    # Judges page
+    judges_path = os.path.join(out_dir or ".", "judges.html")
+    judges_html = generate_judges_html(stats)
+    with open(judges_path, "w") as f:
+        f.write(judges_html)
 
     return output_path
 
@@ -3650,4 +4252,4 @@ if __name__ == "__main__":
         print(f"Companies page generated: {os.path.join(out_dir, 'companies.html')}")
         print(f"Categories page generated: {os.path.join(out_dir, 'categories.html')}")
         print(f"Methodology page generated: {os.path.join(out_dir, 'methodology.html')}")
-        print(f"Prompts page generated: {os.path.join(out_dir, 'prompts.html')}")
+        print(f"Judges page generated: {os.path.join(out_dir, 'judges.html')}")
