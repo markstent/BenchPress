@@ -7,7 +7,7 @@
 ![Tests 168](https://img.shields.io/badge/tests-168-brightgreen)
 ![Models 48](https://img.shields.io/badge/models-48-orange)
 
-![View live leaderboard](https://markstent.github.io/BenchPress/)
+[View live leaderboard](https://markstent.github.io/BenchPress/)
 
 BenchPress runs 80 prompts across 8 categories against any LLM and scores every response through three independent layers: deterministic auto-checks, multi-judge LLM scoring (1-5), and DeepEval G-Eval metrics (0-1). Results persist as JSON, so when a new model drops, one command compares it against everything tested before.
 
