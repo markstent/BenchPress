@@ -7,7 +7,7 @@
 ![Tests 178](https://img.shields.io/badge/tests-178-brightgreen)
 ![Models 50](https://img.shields.io/badge/models-50-orange)
 
-**Live dashboard:** [mark-allwyn.github.io/BenchPress](https://mark-allwyn.github.io/BenchPress/)
+**Live dashboard:** [https://markstent.github.io/BenchPress/](https://markstent.github.io/BenchPress/)
 
 BenchPress runs two independent benchmark suites against any LLM:
 
